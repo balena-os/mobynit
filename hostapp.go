@@ -9,11 +9,12 @@ import (
 	"path/filepath"
 	"runtime"
 
-	_ "github.com/docker/docker/daemon/graphdriver/aufs"
-	_ "github.com/docker/docker/daemon/graphdriver/overlay2"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/idtools"
 	"golang.org/x/sys/unix"
+
+	_ "github.com/docker/docker/daemon/graphdriver/aufs"
+	_ "github.com/docker/docker/daemon/graphdriver/overlay2"
 )
 
 type HostConfig struct {
@@ -21,11 +22,12 @@ type HostConfig struct {
 }
 
 type Config struct {
-	ID         string `json:"ID"`
-	Image      string `json:"Image"`
 	HostConfig `json:"Config"`
-	Name       string `json:"Name"`
-	Driver     string `json:"Driver"`
+
+	ID     string `json:"ID"`
+	Image  string `json:"Image"`
+	Name   string `json:"Name"`
+	Driver string `json:"Driver"`
 }
 
 type Container struct {
@@ -33,14 +35,18 @@ type Container struct {
 	MountPath string
 }
 
-var Containers []Container
-
-var Debug bool = false
-var Verbose bool = false
+var (
+	// Debug enables more verbose logging
+	Debug bool = false
+	// Verbose enables verbose logging
+	Verbose bool = false
+)
 
 // Testing stub substitution
-var rwLayerMount = layer.RWLayer.Mount  // As root, do not mount layer
-var containerMount = (*Container).mount // As user, do not call mount
+var (
+	rwLayerMount   = layer.RWLayer.Mount // As root, do not mount layer
+	containerMount = (*Container).mount  // As user, do not call mount
+)
 
 func (container *Container) mount(layer_root string) string {
 	ls, err := layer.NewStoreFromOptions(layer.StoreOptions{
