@@ -50,7 +50,7 @@ func mountSysroot(rootdir string) ([]hostapp.Container, error) {
 		cid := filepath.Base(current)
 		containers, err = hostapp.Mount(layerRoot, cid)
 		if err != nil {
-			return nil, fmt.Errorf("Error mounting container with ID %d (len %d): %v", cid, len(containers), err)
+			return nil, fmt.Errorf("Error mounting container with ID %s (len %d): %v", cid, len(containers), err)
 		}
 	} else {
 		containers, err = hostapp.Mount(layerRoot, FEATURE_HOSTAPP)
@@ -87,7 +87,7 @@ func mountHostExtensions(newRootPath string) error {
 	device = filepath.Join("/dev", string(os.PathSeparator), path.Base(device))
 	fstype, err := exec.Command(filepath.Join(newRootPath, "/usr/bin/lsblk"), "-no", "FSTYPE", device).Output()
 	if err != nil {
-		log.Print("Data partition file system type could not be detected, default to ext4: ", err)
+		log.Println("Data partition file system type could not be detected, default to ext4:", err)
 		fstype = []byte("ext4")
 	}
 	err = unix.Mount(device, filepath.Join(newRootPath, string(os.PathSeparator), DATA_DIR_NAME), string(fstype), 0, "")
@@ -104,11 +104,9 @@ func mountHostExtensions(newRootPath string) error {
 			case "overlay2":
 				mountOptions = fmt.Sprintf("lowerdir=%s", filepath.Join(newRootPath, string(os.PathListSeparator), container.MountPath))
 				mountType = "overlay"
-				break
 			case "aufs":
 				mountOptions = fmt.Sprintf("br=%s", filepath.Join(newRootPath, string(os.PathListSeparator), container.MountPath))
 				mountType = "aufs"
-				break
 			default:
 				return fmt.Errorf("Only overlay2/aufs host extension mounts supported, not %v", container.Config.Driver)
 			}
@@ -149,13 +147,17 @@ func prepareForPivot() (string, error) {
 	}
 
 	newRootPath = containers[0].MountPath
-	defer unix.Mount("", newRootPath, "", unix.MS_REMOUNT|unix.MS_RDONLY, "")
+	defer func() {
+		if err := unix.Mount("", newRootPath, "", unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
+			log.Println("Error remounting new root as read-only:", err)
+		}
+	}()
 
 	if err := os.MkdirAll(filepath.Join(newRootPath, PIVOT_PATH), os.ModePerm); err != nil {
 		return newRootPath, fmt.Errorf("Creating %s failed: %v", PIVOT_PATH, err)
 	}
 
-	if nohostext == false {
+	if !nohostext {
 		if err := mountHostExtensions(newRootPath); err != nil {
 			log.Print("Host extensions not mounted")
 		}
@@ -171,7 +173,7 @@ func main() {
 		var containers []hostapp.Container
 		containers, err := mountSysroot(*sysrootPtr)
 		if err != nil {
-			log.Fatal("Error mounting sysroot:", err)
+			log.Fatalln("Error mounting sysroot:", err)
 		}
 		fmt.Print(containers[0].MountPath)
 		return
@@ -202,16 +204,16 @@ func main() {
 	// Any mounts done by initrd will be transfered in the new root
 	mounts, err := mount.GetMounts(nil)
 	if err != nil {
-		log.Fatal("could not get mounts:", err)
+		log.Fatalln("could not get mounts:", err)
 	}
 
 	if err := unix.Mount("", "/", "", unix.MS_REMOUNT, ""); err != nil {
-		log.Fatal("error remounting root as read/write:", err)
+		log.Fatalln("error remounting root as read/write:", err)
 	}
 
 	newRoot, err := prepareForPivot()
 	if err != nil {
-		log.Fatal("Error preparing for pivot root: ", err)
+		log.Fatalln("Error preparing for pivot root:", err)
 	}
 
 	for _, mount := range mounts {
@@ -224,7 +226,7 @@ func main() {
 	}
 
 	if err := syscall.PivotRoot(newRoot, filepath.Join(newRoot, PIVOT_PATH)); err != nil {
-		log.Fatal("error while pivoting root:", err)
+		log.Fatalln("error while pivoting root:", err)
 	}
 
 	if err := unix.Chdir("/"); err != nil {
@@ -232,6 +234,6 @@ func main() {
 	}
 
 	if err := syscall.Exec("/sbin/init", os.Args, os.Environ()); err != nil {
-		log.Fatal("error executing init:", err)
+		log.Fatalln("error executing init:", err)
 	}
 }

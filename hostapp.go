@@ -57,22 +57,22 @@ func (container *Container) mount(layer_root string) string {
 		OS:                        runtime.GOOS,
 	})
 	if err != nil {
-		log.Fatal("error loading layer store:", err)
+		log.Fatalln("error loading layer store:", err)
 	}
 
 	rwlayer, err := ls.GetRWLayer(container.Config.ID)
 	if err != nil {
-		log.Fatal("error getting container layer:", err)
+		log.Fatalln("error getting container layer:", err)
 	}
 
 	newRoot, err := rwLayerMount(rwlayer, "")
 	if err != nil {
-		log.Fatal("error mounting container fs:", err)
+		log.Fatalln("error mounting container fs:", err)
 	}
 	container.MountPath = newRoot.Path()
 
 	if err := unix.Mount("", container.MountPath, "", unix.MS_REMOUNT, ""); err != nil {
-		log.Fatal("error remounting container as read/write:", err)
+		log.Fatalln("error remounting container as read/write:", err)
 	}
 
 	return container.MountPath
@@ -95,7 +95,7 @@ func (container *Container) initialize(homePath string) error {
 		log.Println("Initialized container:", container.Config.Name)
 	}
 	if Debug {
-		log.Printf("%+v\n", container.Config)
+		log.Printf("%#+v\n", container.Config)
 	}
 	return nil
 }
@@ -112,10 +112,10 @@ func (container *Container) mountOverlayByID(mountRoot string, targetID string) 
 }
 
 func (container *Container) mountOverlayByLabel(mountRoot string, targetLabel string) (string, error) {
-	if Debug == true {
-		log.Printf("Searching for label %s\n", targetLabel)
+	if Debug {
+		log.Println("Searching for label", targetLabel)
 	}
-	for label, _ := range container.Labels {
+	for label := range container.Labels {
 		if label == targetLabel {
 			if Verbose {
 				log.Printf("Mounted %s in %s\n", label, mountRoot)
@@ -124,7 +124,7 @@ func (container *Container) mountOverlayByLabel(mountRoot string, targetLabel st
 			return newRootPath, nil
 		}
 	}
-	return "", fmt.Errorf("Label %s not found\n", targetLabel)
+	return "", fmt.Errorf("Label %s not found", targetLabel)
 }
 
 func initializeContainers(rootdir string, match string) ([]Container, error) {
@@ -138,7 +138,7 @@ func initializeContainers(rootdir string, match string) ([]Container, error) {
 	mountedContainers := make([]Container, 0)
 	for i, dir := range dirs {
 		if Debug {
-			log.Print("Looking in ", dir.Name())
+			log.Println("Looking in", dir.Name())
 		}
 		if dir.IsDir() {
 			homePath := filepath.Join(containersDir, string(os.PathSeparator), dir.Name())
@@ -153,7 +153,7 @@ func initializeContainers(rootdir string, match string) ([]Container, error) {
 			if Containers[i].ID == match {
 				_, err := Containers[i].mountOverlayByID(rootdir, match)
 				if err != nil {
-					log.Fatal("Failed to mount container:", err)
+					log.Fatalln("Failed to mount container:", err)
 				} else {
 					mountedContainers = append(mountedContainers, Containers[i])
 				}
