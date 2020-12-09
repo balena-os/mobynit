@@ -29,7 +29,8 @@ const (
 	LOG_DIR               = "/tmp/initramfs/"
 	LOG_FILE              = "initramfs.debug"
 	CMDLINE_NO_HOSTEXT    = "balena.nohostext"
-	DATA_DIR_NAME         = "resin-data"
+	DATA_DIR_NAME         = "/mnt/data"
+	DATA_STATE_NAME       = "resin-data"
 	DATA_LAYER_ROOT       = "docker"
 )
 
@@ -65,7 +66,7 @@ func mountSysroot(rootdir string) ([]hostapp.Container, error) {
 }
 
 func mountHostExtensions(newRootPath string) error {
-	device, err := os.Readlink(filepath.Join("/dev/disk/by-state/", DATA_DIR_NAME))
+	device, err := os.Readlink(filepath.Join("/dev/disk/by-state/", DATA_STATE_NAME))
 	if err != nil {
 		return fmt.Errorf("No udev by-state resin-data symbolic link")
 	}
