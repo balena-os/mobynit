@@ -22,16 +22,15 @@ import (
 )
 
 const (
-	HOSTAPP_LAYER_ROOT    = "balena"
-	PIVOT_PATH            = "/mnt/sysroot/active"
-	FEATURE_HOSTAPP       = "io.balena.features.hostapp"
-	FEATURE_HOSTEXTENSION = "io.balena.features.host-extension"
-	LOG_DIR               = "/tmp/initramfs/"
-	LOG_FILE              = "initramfs.debug"
-	DATA_DIR_NAME         = "/mnt/data"
-	DATA_STATE_NAME       = "resin-data"
-	DATA_LAYER_ROOT       = "docker"
+	HOSTAPP_LAYER_ROOT       = "balena"
+	PIVOT_PATH               = "/mnt/sysroot/active"
+	HOSTOS_BLOCKS_CLASS      = "io.balena.image.class"
+	LOG_DIR                  = "/tmp/initramfs/"
+	LOG_FILE                 = "initramfs.debug"
 	CMDLINE_DISABLE_OVERLAYS = "balena.disable_overlays"
+	DATA_DIR_NAME            = "/mnt/data"
+	DATA_STATE_NAME          = "resin-data"
+	DATA_LAYER_ROOT          = "docker"
 )
 
 /* Do not overlay images */
@@ -43,8 +42,6 @@ var dataFstype string
 /* Hostapps contain a current symlink to the hostapp home directory
  * instead of being labelled. This allows for atomic hostapp updates
  * (just a rename on the symlink).
- * Mouting hostapps by label is implemented but not currently used as
- * image labels cannot be atomically updated.
  */
 func mountSysroot(rootdir string) ([]hostapp.Container, error) {
 	var containers []hostapp.Container
@@ -56,9 +53,8 @@ func mountSysroot(rootdir string) ([]hostapp.Container, error) {
 		if err != nil {
 			return nil, fmt.Errorf("Error mounting container with ID %s (len %d): %v", cid, len(containers), err)
 		}
-	} else {
-		containers, err = hostapp.Mount(layerRoot, FEATURE_HOSTAPP)
 	}
+
 	if len(containers) != 1 {
 		return nil, fmt.Errorf("Invalid number of hostapp mounts: %d", len(containers))
 	}
@@ -77,7 +73,7 @@ func mountDataOverlays(newRootPath string) error {
 		return fmt.Errorf("Error mounting data partition: %v", err)
 	}
 
-	containers, err := hostapp.Mount(filepath.Join(newRootPath, string(os.PathSeparator), filepath.Join(DATA_DIR_NAME, string(os.PathSeparator), DATA_LAYER_ROOT)), FEATURE_HOSTEXTENSION)
+	containers, err := hostapp.Mount(filepath.Join(newRootPath, string(os.PathSeparator), filepath.Join(DATA_DIR_NAME, string(os.PathSeparator), DATA_LAYER_ROOT)), HOSTOS_BLOCKS_CLASS)
 	if err == nil {
 		mountOptions := fmt.Sprintf("lowerdir=%s", newRootPath)
 		mountType := "overlay"

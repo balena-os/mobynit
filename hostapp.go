@@ -118,13 +118,15 @@ func (container *Container) mountOverlayByLabel(mountRoot string, targetLabel st
 	if Debug {
 		log.Println("Searching for label", targetLabel)
 	}
-	for label := range container.Labels {
+	for label, value := range container.Labels {
 		if label == targetLabel {
-			if Verbose {
-				log.Printf("Mounted %s in %s\n", container.Config.Name, mountRoot)
+			if value == "overlay" {
+				if Verbose {
+					log.Printf("Mounted %s in %s\n", container.Config.Name, mountRoot)
+				}
+				newRootPath, err := containerMount(container, mountRoot)
+				return newRootPath, err
 			}
-			newRootPath, err := containerMount(container, mountRoot)
-			return newRootPath, err
 		}
 	}
 	return "", fmt.Errorf("Label %s not found", targetLabel)

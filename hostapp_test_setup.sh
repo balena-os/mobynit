@@ -31,7 +31,7 @@ setupContainer() {
 	tag=$(uuidgen)
 	dockerfile=$(cat <<EOF
 FROM busybox:latest
-LABEL ${label}=1
+LABEL ${label}=overlay
 EOF
 )
 	echo "${dockerfile}" | "${ENGINE}" build -t "${tag}" - > /dev/null
