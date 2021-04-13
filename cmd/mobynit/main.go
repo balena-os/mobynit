@@ -28,17 +28,17 @@ const (
 	FEATURE_HOSTEXTENSION = "io.balena.features.host-extension"
 	LOG_DIR               = "/tmp/initramfs/"
 	LOG_FILE              = "initramfs.debug"
-	CMDLINE_NO_HOSTEXT    = "balena.nohostext"
 	DATA_DIR_NAME         = "/mnt/data"
 	DATA_STATE_NAME       = "resin-data"
 	DATA_LAYER_ROOT       = "docker"
+	CMDLINE_DISABLE_OVERLAYS = "balena.disable_overlays"
 )
 
-/* Do not overlay host extensions*/
-var nohostext bool
+/* Do not overlay images */
+var disable_overlays bool
 
-/* Filesystem type for data partition holdign host extensions */
-var hostextFstype string
+/* Filesystem type for data partition */
+var dataFstype string
 
 /* Hostapps contain a current symlink to the hostapp home directory
  * instead of being labelled. This allows for atomic hostapp updates
@@ -65,14 +65,14 @@ func mountSysroot(rootdir string) ([]hostapp.Container, error) {
 	return containers, err
 }
 
-func mountHostExtensions(newRootPath string) error {
+func mountDataOverlays(newRootPath string) error {
 	device, err := os.Readlink(filepath.Join("/dev/disk/by-state/", DATA_STATE_NAME))
 	if err != nil {
 		return fmt.Errorf("No udev by-state resin-data symbolic link")
 	}
 	// As the /dev mount was moved this cannot be used directly
 	device = filepath.Join("/dev", string(os.PathSeparator), path.Base(device))
-	err = unix.Mount(device, filepath.Join(newRootPath, string(os.PathSeparator), DATA_DIR_NAME), hostextFstype, 0, "")
+	err = unix.Mount(device, filepath.Join(newRootPath, string(os.PathSeparator), DATA_DIR_NAME), dataFstype, 0, "")
 	if err != nil {
 		return fmt.Errorf("Error mounting data partition: %v", err)
 	}
@@ -100,15 +100,15 @@ func mountHostExtensions(newRootPath string) error {
 				default:
 					// aufs does not support nested mounts
 					// https://sourceforge.net/p/aufs/mailman/message/31984065/
-					return fmt.Errorf("Only overlay2 host extension mounts supported, not %v", container.Config.Driver)
+					return fmt.Errorf("Only overlay2 images supported, not %v", container.Config.Driver)
 				}
 			}
 
 			if err := unix.Mount(device, newRootPath, mountType, uintptr(0), mountOptions); err != nil {
-				return fmt.Errorf("Error mounting host extension: %v", err)
+				return fmt.Errorf("Error mounting image: %v", err)
 			}
 
-			log.Println("Overlayed host extensions:")
+			log.Println("Overlayed images:")
 			for i, name := range mountedContainers {
 				log.Printf("\t[%d] %s\n", i, name)
 			}
@@ -153,8 +153,8 @@ func prepareForPivot() (string, error) {
 		return newRootPath, fmt.Errorf("Creating %s failed: %v", PIVOT_PATH, err)
 	}
 
-	if !nohostext {
-		if err := mountHostExtensions(newRootPath); err != nil {
+	if !disable_overlays {
+		if err := mountDataOverlays(newRootPath); err != nil {
 			log.Print(err)
 		}
 	}
@@ -163,7 +163,7 @@ func prepareForPivot() (string, error) {
 
 func main() {
 	sysrootPtr := flag.String("sysroot", "", "root of partition e.g. /mnt/sysroot/inactive. Mount destination is returned in stdout")
-	flag.StringVar(&hostextFstype, "dataFstype", "ext4", "Filesystem type for the data partition holding host extensions. Defaults to ext4.")
+	flag.StringVar(&dataFstype, "dataFstype", "ext4", "Filesystem type for the data partition. Defaults to ext4.")
 	flag.Parse()
 
 	if sysrootPtr != nil && *sysrootPtr != "" {
@@ -192,8 +192,8 @@ func main() {
 	if err == nil {
 		args := strings.Fields(string(content))
 		for _, arg := range args {
-			if strings.Contains(arg, "emergency") || strings.Contains(arg, CMDLINE_NO_HOSTEXT) {
-				nohostext = true
+			if strings.Contains(arg, "emergency") || strings.Contains(arg, CMDLINE_DISABLE_OVERLAYS) {
+				disable_overlays = true
 			}
 		}
 	}
