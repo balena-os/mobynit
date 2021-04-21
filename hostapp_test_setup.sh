@@ -66,6 +66,20 @@ startEngine() {
 	done
 }
 
+waitEngine() {
+	_stime=$(date +%s)
+	_etime=$(date +%s)
+	_timeout=10
+	until DOCKER_HOST=unix:///var/run/hostapp-docker.sock docker info > /dev/null; do
+		if [ $(( _etime - _stime )) -le ${_timeout} ]; then
+			sleep 1
+			_etime=$(date +%s)
+		else
+			echo "Timeout starting docker"
+		fi
+	done
+}
+
 main() {
 	if [ ${#} -eq 0 ] ; then
 		usage
@@ -85,6 +99,7 @@ main() {
 
 		echo "Starting engine"
 		startEngine "${rootdir}"
+		waitEngine
 		echo "Setting up container images"
 		# Create container with unique label
 		cid=$(setupContainer "unique-label")
@@ -98,7 +113,7 @@ main() {
 		"${ENGINE}" images
 		"${ENGINE}" ps -a
 		stopEngine
-		sudo chown ${USER}:${USER} ${rootdir} -R
+		sudo chown ${USER}:${USER} ${rootdir} -R || true
 	fi
 	echo "Done"
 }
