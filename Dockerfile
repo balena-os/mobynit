@@ -15,7 +15,7 @@ RUN --mount=target=. \
        make DEST=/out mobynit hostapp.test
 
 FROM scratch AS final
-COPY --from=gobuild /out/* /
+COPY --from=gobuild /out/mobynit /
 
 FROM docker:19.03-dind AS testimage
 RUN apk add bash sudo util-linux
