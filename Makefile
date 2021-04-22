@@ -6,14 +6,12 @@ DOCKER_BUILDTAGS ?= no_btrfs no_cri no_zfs exclude_disk_quota exclude_graphdrive
 GO_BUILDTAGS ?= netgo osusergo static_build $(DOCKER_BUILDTAGS)
 
 mobynit:
-	CGO_ENABLED=0 \
 	$(GO) build -o $(DEST)/$@ \
 		-ldflags "$(GO_LDFLAGS)" \
 		-tags "$(GO_BUILDTAGS)" \
 		./cmd/mobynit
 
 hostapp.test:
-	CGO_ENABLED=0 \
 	$(GO) test -c -o $(DEST)/$@ \
 		-ldflags "$(GO_LDFLAGS)" \
 		-tags "$(GO_BUILDTAGS)"
