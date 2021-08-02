@@ -13,7 +13,6 @@ import (
 	"github.com/docker/docker/pkg/idtools"
 	"golang.org/x/sys/unix"
 
-	_ "github.com/docker/docker/daemon/graphdriver/aufs"
 	_ "github.com/docker/docker/daemon/graphdriver/overlay2"
 )
 
