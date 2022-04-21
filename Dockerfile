@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.2-labs
 
 FROM --platform=${BUILDPLATFORM} docker.io/tonistiigi/xx:golang AS xx
-FROM --platform=${BUILDPLATFORM} golang:alpine AS gobuild
+FROM --platform=${BUILDPLATFORM} golang:1.16-alpine3.13 AS gobuild
 
 RUN apk add make gcc libc-dev git linux-headers
 
