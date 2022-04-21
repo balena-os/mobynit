@@ -3,7 +3,7 @@
 FROM --platform=${BUILDPLATFORM} docker.io/tonistiigi/xx:golang AS xx
 FROM --platform=${BUILDPLATFORM} golang:alpine AS gobuild
 
-RUN apk add make gcc libc-dev
+RUN apk add make gcc libc-dev git
 
 WORKDIR /src
 
