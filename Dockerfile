@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.2-labs
+# syntax=docker/dockerfile:1.9-labs
 
 FROM --platform=${BUILDPLATFORM} docker.io/tonistiigi/xx:golang AS xx
 FROM --platform=${BUILDPLATFORM} golang:1.16-alpine3.13 AS gobuild
