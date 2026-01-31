@@ -3,18 +3,12 @@ package hostapp
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
-	"runtime"
+	"strings"
 
-	"github.com/docker/docker/layer"
-	"github.com/docker/docker/pkg/idtools"
 	"golang.org/x/sys/unix"
-
-	_ "github.com/docker/docker/daemon/graphdriver/aufs"
-	_ "github.com/docker/docker/daemon/graphdriver/overlay2"
 )
 
 type HostConfig struct {
@@ -42,50 +36,77 @@ var (
 	Verbose bool = false
 )
 
-// Testing stub substitution
-var (
-	rwLayerMount   = layer.RWLayer.Mount // As root, do not mount layer
-	containerMount = (*Container).mount  // As user, do not call mount
-)
+// mount mounts the container's overlay filesystem using direct overlay2 metadata reading
+func (container *Container) mount(layerRoot string) (string, error) {
+	if container.Driver != "overlay2" {
+		return "", fmt.Errorf("unsupported driver %s for container %s", container.Driver, container.Name)
+	}
 
-func (container *Container) mount(layer_root string) (string, error) {
-	ls, err := layer.NewStoreFromOptions(layer.StoreOptions{
-		Root:                      layer_root,
-		MetadataStorePathTemplate: filepath.Join(layer_root, "image", "%s", "layerdb"),
-		IDMapping:                 &idtools.IdentityMapping{},
-		GraphDriver:               container.Config.Driver,
-		OS:                        runtime.GOOS,
-	})
+	// Get mount-id from layerdb
+	mountIDPath := filepath.Join(layerRoot, "image", "overlay2", "layerdb", "mounts", container.ID, "mount-id")
+	mountIDBytes, err := os.ReadFile(mountIDPath)
 	if err != nil {
-		return "", fmt.Errorf("error loading layer store: %v", err)
+		return "", fmt.Errorf("reading mount-id: %w", err)
+	}
+	mountID := strings.TrimSpace(string(mountIDBytes))
+
+	overlay2Dir := filepath.Join(layerRoot, "overlay2")
+	layerDir := filepath.Join(overlay2Dir, mountID)
+
+	// The layer's own diff directory - this is the top layer
+	diffDir := filepath.Join(layerDir, "diff")
+
+	// Read lower file to get parent layer chain
+	lowerPath := filepath.Join(layerDir, "lower")
+	lowerBytes, err := os.ReadFile(lowerPath)
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("reading lower file: %w", err)
 	}
 
-	rwlayer, err := ls.GetRWLayer(container.Config.ID)
-	if err != nil {
-		return "", fmt.Errorf("error getting container layer: %v", err)
+	// Build lowerdir list: diff first, then all parent layers (including init)
+	// For readonly overlay, diff is part of lowerdir (no upperdir)
+	lowerDirs := []string{diffDir}
+
+	if len(lowerBytes) > 0 {
+		links := strings.Split(strings.TrimSpace(string(lowerBytes)), ":")
+		for _, link := range links {
+			resolved, err := filepath.EvalSymlinks(filepath.Join(overlay2Dir, link))
+			if err != nil {
+				return "", fmt.Errorf("resolving %s: %w", link, err)
+			}
+			lowerDirs = append(lowerDirs, resolved)
+		}
 	}
 
-	newRoot, err := rwLayerMount(rwlayer, "")
-	if err != nil {
-		return "", fmt.Errorf("error mounting container fs: %v", err)
+	// Mount point: overlay2/<mount-id>/merged
+	mountPoint := filepath.Join(layerDir, "merged")
+	if err := os.MkdirAll(mountPoint, 0755); err != nil {
+		return "", fmt.Errorf("creating mount point: %w", err)
 	}
-	container.MountPath = newRoot.Path()
 
-	if err := unix.Mount("", container.MountPath, "", unix.MS_REMOUNT, ""); err != nil {
-		return "", fmt.Errorf("error remounting container as read/write: %v", err)
+	// Build overlay options (readonly - no upperdir/workdir)
+	opts := "lowerdir=" + strings.Join(lowerDirs, ":")
+	if len(opts) >= os.Getpagesize()-1 {
+		return "", fmt.Errorf("mount options (%d bytes) exceed page size limit", len(opts))
 	}
+
+	if err := unix.Mount("overlay", mountPoint, "overlay", 0, opts); err != nil {
+		return "", fmt.Errorf("mounting overlay: %w", err)
+	}
+
+	container.MountPath = mountPoint
 	if Debug {
-		log.Printf("Mounted ID %s in %s\n", container.Config.ID, container.MountPath)
+		log.Printf("Mounted ID %s in %s\n", container.ID, container.MountPath)
 	}
 
 	return container.MountPath, nil
 }
 
+// initialize reads container config
 func (container *Container) initialize(homePath string) error {
-	configPath := filepath.Join(homePath, string(os.PathSeparator), "config.v2.json")
+	configPath := filepath.Join(homePath, "config.v2.json")
 	f, err := os.Open(configPath)
 	if err != nil {
-		fmt.Printf("%s\n", err)
 		return err
 	}
 	defer f.Close()
@@ -97,86 +118,76 @@ func (container *Container) initialize(homePath string) error {
 	if Verbose || Debug {
 		log.Println("Initialized container:", container.Config.Name)
 	}
-	if Debug {
-		log.Printf("%#+v\n", container.Config)
-	}
 	return nil
 }
 
-func (container *Container) mountOverlayByID(mountRoot string, targetID string) (string, error) {
-	if container.ID == targetID {
-		if Verbose {
-			log.Printf("Mounted %s in %s\n", targetID, mountRoot)
-		}
-		newRootPath, err := containerMount(container, mountRoot)
-		return newRootPath, err
-	}
-	return "", fmt.Errorf("ID %s not found\n", targetID)
-}
-
-func (container *Container) mountOverlayByLabel(mountRoot string, targetLabel string) (string, error) {
-	if Debug {
-		log.Println("Searching for label", targetLabel)
-	}
-	for label, value := range container.Labels {
-		if label == targetLabel {
-			if value == "overlay" {
-				if Verbose {
-					log.Printf("Mounted %s in %s\n", container.Config.Name, mountRoot)
-				}
-				newRootPath, err := containerMount(container, mountRoot)
-				return newRootPath, err
-			}
-		}
-	}
-	return "", fmt.Errorf("Label %s not found", targetLabel)
-}
-
+// initializeContainers finds and mounts containers
 func initializeContainers(rootdir string, match string) ([]Container, error) {
 	containersDir := filepath.Join(rootdir, "containers")
-	dirs, err := ioutil.ReadDir(containersDir)
+	entries, err := os.ReadDir(containersDir)
 	if err != nil {
-		fmt.Println(err)
-		return nil, err
+		return nil, fmt.Errorf("reading containers directory: %w", err)
 	}
-	Containers := make([]Container, 0)
-	mountedContainers := make([]Container, 0)
-	for i, dir := range dirs {
-		if Debug {
-			log.Println("Looking in", dir.Name())
+
+	var mountedContainers []Container
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
 		}
-		if dir.IsDir() {
-			homePath := filepath.Join(containersDir, string(os.PathSeparator), dir.Name())
-			Containers = append(Containers, Container{})
-			if Containers[i].initialize(homePath) != nil {
-				log.Println("Error initializing container")
-				return nil, err
-			}
+
+		homePath := filepath.Join(containersDir, entry.Name())
+		var container Container
+
+		if err := container.initialize(homePath); err != nil {
 			if Debug {
-				log.Printf("Trying to mount %s from %s\n", match, homePath)
+				log.Println("Error initializing container:", err)
 			}
-			if Containers[i].ID == match {
-				_, err := Containers[i].mountOverlayByID(rootdir, match)
-				if err != nil {
-					log.Println("Failed to mount container:", err)
-				} else {
-					mountedContainers = append(mountedContainers, Containers[i])
-				}
-			} else {
-				_, err := Containers[i].mountOverlayByLabel(rootdir, match)
-				if err == nil {
-					mountedContainers = append(mountedContainers, Containers[i])
-				}
-			}
+			continue
+		}
+
+		// Match by ID prefix or by label
+		matched := false
+		if strings.HasPrefix(container.ID, match) {
+			matched = true
+		} else if val, ok := container.Labels[match]; ok && val == "overlay" {
+			matched = true
+		}
+
+		if !matched {
+			continue
+		}
+
+		if _, err := container.mount(rootdir); err != nil {
+			log.Println("Failed to mount container:", err)
+		} else {
+			mountedContainers = append(mountedContainers, container)
 		}
 	}
-	return mountedContainers, err
+
+	return mountedContainers, nil
 }
 
-// Mount a container union filesystem matching either by ID or label
+// Mount finds and mounts container overlay filesystems matching by ID or label
 func Mount(rootdir string, label string) ([]Container, error) {
 	if Debug {
 		log.Printf("Searching for container with ID/label %s in root directory %s\n", label, rootdir)
 	}
 	return initializeContainers(rootdir, label)
+}
+
+// BuildOverlayOptions constructs overlay mount options for stacking containers.
+// The first path is the base (hostapp), subsequent paths are overlay containers.
+// Returns the mount options string. If options would exceed page size, it stops
+// adding paths and returns what fits.
+func BuildOverlayOptions(basePath string, overlayPaths []string) string {
+	opts := "lowerdir=" + basePath
+	for _, path := range overlayPaths {
+		newOpts := opts + ":" + path
+		if len(newOpts) >= os.Getpagesize()-1 {
+			break
+		}
+		opts = newOpts
+	}
+	return opts
 }

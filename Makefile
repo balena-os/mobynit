@@ -2,8 +2,7 @@ DEST ?= .
 
 GO ?= go
 GO_LDFLAGS ?= -extldflags "-static" -s -w
-DOCKER_BUILDTAGS ?= no_btrfs no_cri no_devmapper no_zfs exclude_disk_quota exclude_graphdriver_btrfs exclude_graphdriver_devicemapper exclude_graphdriver_zfs
-GO_BUILDTAGS ?= netgo osusergo static_build $(DOCKER_BUILDTAGS)
+GO_BUILDTAGS ?= netgo osusergo static_build
 
 mobynit:
 	$(GO) build -o $(DEST)/$@ \
@@ -16,9 +15,21 @@ hostapp.test:
 		-ldflags "$(GO_LDFLAGS)" \
 		-tags "$(GO_BUILDTAGS)"
 
+mobynit.test:
+	$(GO) test -c -o $(DEST)/$@ \
+		-ldflags "$(GO_LDFLAGS)" \
+		-tags "$(GO_BUILDTAGS)" \
+		./cmd/mobynit
+
+.PHONY: test-unit
+test-unit:
+	$(GO) test -v -tags "$(GO_BUILDTAGS)" -run "^Test(BuildOverlayOptions|CollectUniqueLayers)" .
+
+.PHONY: test-all
+test-all: hostapp.test mobynit.test
 
 RM ?= rm
 
 .PHONY: clean
 clean:
-	$(RM) mobynit hostapp.test
+	$(RM) -f mobynit hostapp.test mobynit.test

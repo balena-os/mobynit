@@ -2,7 +2,7 @@
 set -ex
 
 HERE=${HERE:="."}
-if [ -d "${HERE}/deploy" ]; then
+if [ ! -d "${HERE}/deploy" ]; then
 	mkdir -p "${HERE}"/deploy
 fi
 
@@ -22,6 +22,6 @@ DOCKER_BUILDKIT=1 \
 	--tag=mobynit-test \
 	"${HERE}"
 
-docker run --privileged --rm -it \
+docker run --privileged --rm \
 	--mount=type=tmpfs,target=/var/lib/docker \
 	mobynit-test
