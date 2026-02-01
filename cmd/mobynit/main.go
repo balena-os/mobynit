@@ -87,6 +87,7 @@ const (
 	LOG_DIR                  = "/tmp/initramfs/"
 	LOG_FILE                 = "initramfs.debug"
 	CMDLINE_DISABLE_OVERLAYS = "balena.disable_overlays"
+	CMDLINE_DEBUG_SHELL      = "mobynit.shell"
 	DATA_DIR_NAME            = "/mnt/data"
 	DATA_STATE_NAME          = "resin-data"
 	DATA_LAYER_ROOT          = "docker"
@@ -94,6 +95,9 @@ const (
 
 /* Do not overlay images */
 var disable_overlays bool
+
+/* Drop to debug shell instead of exec init */
+var debug_shell bool
 
 /* Filesystem type for data partition */
 var dataFstype string
@@ -213,6 +217,7 @@ func prepareForPivot() (string, error) {
 			log.Print(err)
 		}
 	}
+
 	return newRootPath, nil
 }
 
@@ -250,6 +255,9 @@ func main() {
 			if strings.Contains(arg, "emergency") || strings.Contains(arg, CMDLINE_DISABLE_OVERLAYS) {
 				disable_overlays = true
 			}
+			if strings.Contains(arg, CMDLINE_DEBUG_SHELL) {
+				debug_shell = true
+			}
 		}
 	}
 
@@ -283,6 +291,13 @@ func main() {
 
 	if err := unix.Chdir("/"); err != nil {
 		log.Fatal(err)
+	}
+
+	if debug_shell {
+		log.Println("mobynit.shell: dropping to debug shell")
+		if err := syscall.Exec("/bin/sh", []string{"/bin/sh"}, os.Environ()); err != nil {
+			log.Fatalln("error executing shell:", err)
+		}
 	}
 
 	if err := syscall.Exec("/sbin/init", os.Args, os.Environ()); err != nil {
