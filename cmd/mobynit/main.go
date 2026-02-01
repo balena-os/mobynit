@@ -86,7 +86,7 @@ const (
 	HOSTOS_BLOCKS_CLASS      = "io.balena.image.class"
 	LOG_DIR                  = "/tmp/initramfs/"
 	LOG_FILE                 = "initramfs.debug"
-	CMDLINE_DISABLE_OVERLAYS = "balena.disable_overlays"
+	CMDLINE_DISABLE_OVERLAYS = "mobynit.no_overlays"
 	CMDLINE_DEBUG_SHELL      = "mobynit.shell"
 	DATA_DIR_NAME            = "/mnt/data"
 	DATA_STATE_NAME          = "resin-data"
