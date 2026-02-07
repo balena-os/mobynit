@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -198,18 +199,56 @@ func Mount(rootdir string, label string) ([]Container, error) {
 	return initializeContainers(rootdir, label)
 }
 
-// BuildOverlayOptions constructs overlay mount options for stacking containers.
-// The first path is the base (hostapp), subsequent paths are overlay containers.
-// Returns the mount options string. If options would exceed page size, it stops
-// adding paths and returns what fits.
-func BuildOverlayOptions(basePath string, overlayPaths []string) string {
-	opts := "lowerdir=" + basePath
-	for _, path := range overlayPaths {
-		newOpts := opts + ":" + path
-		if len(newOpts) >= os.Getpagesize()-1 {
+const HOSTOS_BLOCKS_OVERRIDE = "io.balena.image.override"
+
+// OverrideContainer represents an extension that mounts left of the hostapp
+// in the overlayfs lowerdir, giving it higher lookup priority.
+type OverrideContainer struct {
+	MountPath string
+	Name      string
+	Priority  int
+}
+
+// BuildOverlayOptions constructs lowerdir with override extensions before basePath
+// and normal extensions after. Overrides sorted by priority (lower = higher overlayfs priority).
+// basePath is always included. Overrides are added highest-priority-first as space allows,
+// then normal paths. Anything that would exceed page size is dropped with a log warning.
+func BuildOverlayOptions(basePath string, overrides []OverrideContainer, normalPaths []string) string {
+	sort.Slice(overrides, func(i, j int) bool {
+		if overrides[i].Priority != overrides[j].Priority {
+			return overrides[i].Priority < overrides[j].Priority
+		}
+		return overrides[i].Name < overrides[j].Name
+	})
+
+	pageLimit := os.Getpagesize() - 1
+
+	// Phase 1: prepend overrides (highest priority first) while basePath still fits
+	prefix := "lowerdir="
+	included := 0
+	for _, o := range overrides {
+		candidate := prefix + o.MountPath + ":" + basePath
+		if len(candidate) >= pageLimit {
 			break
 		}
-		opts = newOpts
+		prefix += o.MountPath + ":"
+		included++
 	}
+	if included < len(overrides) {
+		log.Printf("Warning: dropped %d override(s) due to page size limit", len(overrides)-included)
+	}
+
+	opts := prefix + basePath
+
+	// Phase 2: append normal paths as space allows
+	for _, p := range normalPaths {
+		candidate := opts + ":" + p
+		if len(candidate) >= pageLimit {
+			log.Println("Warning: mount options capped at page size, some extensions dropped")
+			break
+		}
+		opts = candidate
+	}
+
 	return opts
 }
