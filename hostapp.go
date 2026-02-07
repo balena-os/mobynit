@@ -15,6 +15,11 @@ type HostConfig struct {
 	Labels map[string]string `json:"Labels"`
 }
 
+type State struct {
+	Dead              bool `json:"Dead"`
+	RemovalInProgress bool `json:"RemovalInProgress"`
+}
+
 type Config struct {
 	HostConfig `json:"Config"`
 
@@ -22,6 +27,7 @@ type Config struct {
 	Image  string `json:"Image"`
 	Name   string `json:"Name"`
 	Driver string `json:"Driver"`
+	State  State  `json:"State"`
 }
 
 type Container struct {
@@ -150,6 +156,14 @@ func initializeContainers(rootdir string, match string) ([]Container, error) {
 		if err := container.initialize(homePath); err != nil {
 			if Debug {
 				log.Println("Error initializing container:", err)
+			}
+			continue
+		}
+
+		// Skip dead or pending-removal containers
+		if container.State.Dead || container.State.RemovalInProgress {
+			if Verbose {
+				log.Printf("Skipping dead container: %s", container.Name)
 			}
 			continue
 		}
