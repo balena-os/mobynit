@@ -695,6 +695,106 @@ func TestNoDockerenvInOverlay(t *testing.T) {
 	}
 }
 
+// TestGetKernelVersion verifies that GetKernelVersion returns a valid kernel version string.
+func TestGetKernelVersion(t *testing.T) {
+	ver, err := GetKernelVersion()
+	if err != nil {
+		t.Fatalf("GetKernelVersion failed: %v", err)
+	}
+	if ver == "" {
+		t.Fatal("GetKernelVersion returned empty string")
+	}
+	// Should be M.m.p format (e.g., "6.8.0"), no local extensions
+	if ver[0] < '0' || ver[0] > '9' {
+		t.Errorf("unexpected kernel version format: %q", ver)
+	}
+	if strings.Contains(ver, "-") {
+		t.Errorf("kernel version should not contain local extensions: %q", ver)
+	}
+	t.Logf("Kernel version: %s", ver)
+}
+
+// TestFilterByKernelVersion tests the kernel version filtering logic.
+func TestFilterByKernelVersion(t *testing.T) {
+	makeContainer := func(name string, labels map[string]string) Container {
+		return Container{
+			Config: Config{
+				HostConfig: HostConfig{Labels: labels},
+				Name:       name,
+			},
+		}
+	}
+
+	tests := []struct {
+		name          string
+		containers    []Container
+		kernelVersion string
+		expectNames   []string
+	}{
+		{
+			name: "no label passes through",
+			containers: []Container{
+				makeContainer("no-label", map[string]string{"io.balena.image.class": "overlay"}),
+			},
+			kernelVersion: "6.1.0",
+			expectNames:   []string{"no-label"},
+		},
+		{
+			name: "matching label passes",
+			containers: []Container{
+				makeContainer("match", map[string]string{HOSTOS_BLOCKS_KERNEL_VERSION: "6.1.0"}),
+			},
+			kernelVersion: "6.1.0",
+			expectNames:   []string{"match"},
+		},
+		{
+			name: "mismatched label filtered",
+			containers: []Container{
+				makeContainer("old", map[string]string{HOSTOS_BLOCKS_KERNEL_VERSION: "5.15.0"}),
+			},
+			kernelVersion: "6.1.0",
+			expectNames:   nil,
+		},
+		{
+			name: "mixed: keep matching and unlabelled, skip mismatched",
+			containers: []Container{
+				makeContainer("match", map[string]string{HOSTOS_BLOCKS_KERNEL_VERSION: "6.1.0"}),
+				makeContainer("old", map[string]string{HOSTOS_BLOCKS_KERNEL_VERSION: "5.15.0"}),
+				makeContainer("unlabelled", map[string]string{"io.balena.image.class": "overlay"}),
+			},
+			kernelVersion: "6.1.0",
+			expectNames:   []string{"match", "unlabelled"},
+		},
+		{
+			name: "empty kernel version passes all",
+			containers: []Container{
+				makeContainer("a", map[string]string{HOSTOS_BLOCKS_KERNEL_VERSION: "6.1.0"}),
+				makeContainer("b", map[string]string{HOSTOS_BLOCKS_KERNEL_VERSION: "5.15.0"}),
+			},
+			kernelVersion: "",
+			expectNames:   []string{"a", "b"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := FilterByKernelVersion(tt.containers, tt.kernelVersion)
+			var gotNames []string
+			for _, c := range result {
+				gotNames = append(gotNames, c.Name)
+			}
+			if len(gotNames) != len(tt.expectNames) {
+				t.Fatalf("expected %v, got %v", tt.expectNames, gotNames)
+			}
+			for i, name := range gotNames {
+				if name != tt.expectNames[i] {
+					t.Errorf("index %d: expected %q, got %q", i, tt.expectNames[i], name)
+				}
+			}
+		})
+	}
+}
+
 // loadFingerprint reads a fingerprint file and adds entries to the checksums map.
 // Fingerprint format: "md5sum  /path/to/file" (standard md5sum output)
 // Paths are stored without leading slash to allow proper path joining.

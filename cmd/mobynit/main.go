@@ -156,6 +156,18 @@ func mountDataOverlays(newRootPath string) error {
 		return nil
 	}
 
+	// Filter out extensions built for a different kernel version
+	kernelVer, err := hostapp.GetKernelVersion()
+	if err != nil {
+		log.Printf("Warning: could not get kernel version, skipping kernel filter: %v", err)
+	} else {
+		containers = hostapp.FilterByKernelVersion(containers, kernelVer)
+		if len(containers) == 0 {
+			log.Println("No extensions match running kernel version, skipping overlay")
+			return nil
+		}
+	}
+
 	var overrides []hostapp.OverrideContainer
 	var normalPaths []string
 

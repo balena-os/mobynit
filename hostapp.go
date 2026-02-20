@@ -200,6 +200,46 @@ func Mount(rootdir string, label string) ([]Container, error) {
 }
 
 const HOSTOS_BLOCKS_OVERRIDE = "io.balena.image.override"
+const HOSTOS_BLOCKS_KERNEL_VERSION = "io.balena.image.kernel-version"
+
+// GetKernelVersion returns the running kernel's M.m.p version via uname syscall.
+// Local extensions (e.g., "-v8+", "-100-generic") are stripped since ABI
+// compatibility only depends on the major.minor.patch version.
+func GetKernelVersion() (string, error) {
+	var utsname unix.Utsname
+	if err := unix.Uname(&utsname); err != nil {
+		return "", fmt.Errorf("uname syscall failed: %w", err)
+	}
+	// Convert null-terminated byte array to string
+	release := utsname.Release
+	n := 0
+	for n < len(release) && release[n] != 0 {
+		n++
+	}
+	full := string(release[:n])
+	// Strip local extensions: "6.8.0-100-generic" → "6.8.0"
+	if idx := strings.IndexByte(full, '-'); idx > 0 {
+		return full[:idx], nil
+	}
+	return full, nil
+}
+
+// FilterByKernelVersion removes containers whose kernel-version label
+// doesn't match the running kernel. Containers without the label always pass.
+func FilterByKernelVersion(containers []Container, kernelVersion string) []Container {
+	if kernelVersion == "" {
+		return containers
+	}
+	var filtered []Container
+	for _, c := range containers {
+		if labelVal, ok := c.Labels[HOSTOS_BLOCKS_KERNEL_VERSION]; ok && labelVal != kernelVersion {
+			log.Printf("Skipping container %s: kernel version %q != running %q", c.Name, labelVal, kernelVersion)
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	return filtered
+}
 
 // OverrideContainer represents an extension that mounts left of the hostapp
 // in the overlayfs lowerdir, giving it higher lookup priority.
