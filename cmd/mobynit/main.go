@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -15,11 +16,69 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/docker/docker/pkg/mount"
 	"golang.org/x/sys/unix"
 
 	"github.com/balena-os/hostapp"
 )
+
+// MountInfo represents a mount point from /proc/self/mountinfo
+type MountInfo struct {
+	Mountpoint string
+}
+
+// getMounts parses /proc/self/mountinfo and returns mount points
+func getMounts() ([]MountInfo, error) {
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var mounts []MountInfo
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		// mountinfo format: ID PARENT_ID MAJOR:MINOR ROOT MOUNTPOINT OPTIONS...
+		// Fields are space-separated, mountpoint is field 5 (index 4)
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 5 {
+			continue
+		}
+		// Unescape octal sequences in mountpoint (e.g., \040 for space)
+		mountpoint := unescapeMountpoint(fields[4])
+		mounts = append(mounts, MountInfo{Mountpoint: mountpoint})
+	}
+	return mounts, scanner.Err()
+}
+
+// unescapeMountpoint handles octal escape sequences in mountinfo
+// Escaped chars: space(\040), tab(\011), newline(\012), backslash(\134)
+func unescapeMountpoint(s string) string {
+	if strings.IndexByte(s, '\\') == -1 {
+		return s
+	}
+
+	buf := make([]byte, len(s))
+	bufLen := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' || i+3 >= len(s) {
+			buf[bufLen] = s[i]
+			bufLen++
+			continue
+		}
+		// Check for valid octal escape \NNN
+		c1, c2, c3 := s[i+1], s[i+2], s[i+3]
+		if c1 >= '0' && c1 <= '7' && c2 >= '0' && c2 <= '7' && c3 >= '0' && c3 <= '7' {
+			v := (c1-'0')<<6 | (c2-'0')<<3 | (c3 - '0')
+			buf[bufLen] = v
+			bufLen++
+			i += 3
+		} else {
+			buf[bufLen] = s[i]
+			bufLen++
+		}
+	}
+	return string(buf[:bufLen])
+}
 
 const (
 	HOSTAPP_LAYER_ROOT       = "balena"
@@ -84,7 +143,7 @@ func mountDataOverlays(newRootPath string) error {
 				switch container.Config.Driver {
 				case "overlay2":
 					oldMountOptions := mountOptions
-					mountOptions += filepath.Join(string(os.PathListSeparator), container.MountPath)
+					mountOptions += ":" + container.MountPath
 					// The kernel limits the mount option to PAGE_SIZE-1
 					// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/namespace.c?h=master#n3109
 					if len(mountOptions) >= os.Getpagesize()-1 {
@@ -195,7 +254,7 @@ func main() {
 	}
 
 	// Any mounts done by initrd will be transfered in the new root
-	mounts, err := mount.GetMounts(nil)
+	mounts, err := getMounts()
 	if err != nil {
 		log.Fatalln("could not get mounts:", err)
 	}
@@ -209,12 +268,12 @@ func main() {
 		log.Fatalln("Error preparing for pivot root:", err)
 	}
 
-	for _, mount := range mounts {
-		if mount.Mountpoint == "/" {
+	for _, m := range mounts {
+		if m.Mountpoint == "/" {
 			continue
 		}
-		if err := unix.Mount(mount.Mountpoint, filepath.Join(newRoot, mount.Mountpoint), "", unix.MS_MOVE, ""); err != nil {
-			log.Println("could not move mountpoint:", mount.Mountpoint, err)
+		if err := unix.Mount(m.Mountpoint, filepath.Join(newRoot, m.Mountpoint), "", unix.MS_MOVE, ""); err != nil {
+			log.Println("could not move mountpoint:", m.Mountpoint, err)
 		}
 	}
 
