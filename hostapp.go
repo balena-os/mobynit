@@ -74,6 +74,14 @@ func (container *Container) mount(layerRoot string) (string, error) {
 			if err != nil {
 				return "", fmt.Errorf("resolving %s: %w", link, err)
 			}
+			// Skip init layers - they contain .dockerenv which causes
+			// systemd to detect container mode
+			if strings.Contains(resolved, "-init/") {
+				if Debug {
+					log.Printf("Skipping init layer: %s", resolved)
+				}
+				continue
+			}
 			lowerDirs = append(lowerDirs, resolved)
 		}
 	}

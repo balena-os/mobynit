@@ -503,8 +503,73 @@ func TestOverlayStacking(t *testing.T) {
 		t.Fatalf("Overlay stacking failed: %d checksum errors", checksumErrors)
 	}
 
+	// Step 7: Verify .dockerenv does not exist (would cause systemd to think it's in a container)
+	dockerenvPath := filepath.Join(stackedMount, ".dockerenv")
+	if _, err := os.Lstat(dockerenvPath); err == nil {
+		t.Errorf(".dockerenv exists in stacked mount - this will cause systemd to detect container mode")
+	} else if !os.IsNotExist(err) {
+		t.Errorf("Error checking .dockerenv: %v", err)
+	}
+
 	t.Logf("Overlay stacking verified: %d files, %d skipped, %d unexpected",
 		verifiedFiles, skippedFiles, len(unexpectedFiles))
+}
+
+// TestNoDockerenvInOverlay verifies that .dockerenv does not exist in container mounts.
+// Docker creates .dockerenv when containers are created (docker create/run), which
+// causes systemd to detect container mode and skip hardware initialization.
+func TestNoDockerenvInOverlay(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root to perform overlay mount")
+	}
+
+	if *rootdir == "" {
+		t.Skip("This test requires a --rootdir flag")
+	}
+
+	// Create mount namespace for isolation
+	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+		t.Fatalf("failed to create mount namespace: %v", err)
+	}
+	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
+		t.Fatalf("failed to make mounts private: %v", err)
+	}
+
+	// Mount hostapp container
+	hostappCurrent := filepath.Join(*rootdir, "current")
+	current, err := os.Readlink(hostappCurrent)
+	if err != nil {
+		t.Skip("No hostapp available (current symlink missing)")
+	}
+	cid := filepath.Base(current)
+
+	containers, err := Mount(*rootdir, cid)
+	if err != nil {
+		t.Fatalf("Mount hostapp failed: %v", err)
+	}
+	if len(containers) != 1 {
+		t.Fatalf("Expected 1 container, got %d", len(containers))
+	}
+
+	// Check hostapp for .dockerenv
+	dockerenvPath := filepath.Join(containers[0].MountPath, ".dockerenv")
+	if _, err := os.Lstat(dockerenvPath); err == nil {
+		t.Errorf("Hostapp container has .dockerenv at %s - this will cause systemd to detect container mode", dockerenvPath)
+	}
+
+	// Mount and check OS block containers
+	osBlocks, err := Mount(*rootdir, "io.balena.image.class")
+	if err != nil {
+		t.Logf("No OS blocks to check: %v", err)
+		return
+	}
+
+	for _, c := range osBlocks {
+		dockerenvPath := filepath.Join(c.MountPath, ".dockerenv")
+		if _, err := os.Lstat(dockerenvPath); err == nil {
+			t.Errorf("OS block %s has .dockerenv at %s - this will cause systemd to detect container mode", c.Name, dockerenvPath)
+		}
+	}
 }
 
 // loadFingerprint reads a fingerprint file and adds entries to the checksums map.
