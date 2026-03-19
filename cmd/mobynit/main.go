@@ -89,6 +89,7 @@ const (
 	DATA_DIR_NAME            = "/mnt/data"
 	DATA_STATE_NAME          = "resin-data"
 	DATA_LAYER_ROOT          = "docker"
+	PURGE_MARKER_FILE        = "remove_me_to_reset"
 )
 
 /* Do not overlay images */
@@ -126,9 +127,18 @@ func mountDataOverlays(newRootPath string) error {
 	}
 	// As the /dev mount was moved this cannot be used directly
 	device = filepath.Join("/dev", string(os.PathSeparator), path.Base(device))
-	err = unix.Mount(device, filepath.Join(newRootPath, string(os.PathSeparator), DATA_DIR_NAME), dataFstype, 0, "")
+	dataMountPath := filepath.Join(newRootPath, string(os.PathSeparator), DATA_DIR_NAME)
+	err = unix.Mount(device, dataMountPath, dataFstype, 0, "")
 	if err != nil {
 		return fmt.Errorf("Error mounting data partition: %v", err)
+	}
+
+	// Check for pending purge - if remove_me_to_reset is missing,
+	// data partition will be wiped after boot, so skip extension mounting
+	purgeMarker := filepath.Join(dataMountPath, PURGE_MARKER_FILE)
+	if _, err := os.Stat(purgeMarker); os.IsNotExist(err) {
+		log.Println("Purge pending: remove_me_to_reset missing, skipping extension overlays")
+		return nil
 	}
 
 	containers, err := hostapp.Mount(filepath.Join(newRootPath, string(os.PathSeparator), filepath.Join(DATA_DIR_NAME, string(os.PathSeparator), DATA_LAYER_ROOT)), HOSTOS_BLOCKS_CLASS)
