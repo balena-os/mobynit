@@ -8,7 +8,6 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path"
@@ -86,7 +85,7 @@ const (
 	HOSTOS_BLOCKS_CLASS      = "io.balena.image.class"
 	LOG_DIR                  = "/tmp/initramfs/"
 	LOG_FILE                 = "initramfs.debug"
-	CMDLINE_DISABLE_OVERLAYS = "balena.disable_overlays"
+	CMDLINE_DISABLE_OVERLAYS = "mobynit.no_overlays"
 	DATA_DIR_NAME            = "/mnt/data"
 	DATA_STATE_NAME          = "resin-data"
 	DATA_LAYER_ROOT          = "docker"
@@ -243,7 +242,7 @@ func main() {
 		log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 	}
 
-	content, err := ioutil.ReadFile("/proc/cmdline")
+	content, err := os.ReadFile("/proc/cmdline")
 	if err == nil {
 		args := strings.Fields(string(content))
 		for _, arg := range args {

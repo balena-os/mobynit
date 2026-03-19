@@ -38,7 +38,7 @@ mobynit -dataFstype=ext4  # Data partition filesystem type (default: ext4)
 ### Kernel cmdline options
 
 - `emergency` - Skip OS blocks overlay mounting
-- `balena.disable_overlays` - Skip OS blocks overlay mounting
+- `mobynit.no_overlays` - Skip OS blocks overlay mounting
 
 ## Requirements
 
