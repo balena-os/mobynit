@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -119,13 +120,12 @@ func (container *Container) initialize(homePath string) error {
 	configPath := filepath.Join(homePath, "config.v2.json")
 	f, err := os.Open(configPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("opening %s: %w", configPath, err)
 	}
 	defer f.Close()
 
 	if err := json.NewDecoder(f).Decode(&container.Config); err != nil {
-		log.Println("Error decoding config file:", err)
-		return err
+		return fmt.Errorf("decoding %s: %w", configPath, err)
 	}
 	if Verbose || Debug {
 		log.Println("Initialized container:", container.Config.Name)
@@ -158,9 +158,7 @@ func initializeContainers(rootdir string, match string) ([]Container, error) {
 
 		// Skip dead or pending-removal containers
 		if container.State.Dead || container.State.RemovalInProgress {
-			if Verbose {
-				log.Printf("Skipping dead container: %s", container.Name)
-			}
+			log.Printf("Skipping dead container: %s (%s)", container.Name, container.ID)
 			continue
 		}
 
@@ -194,18 +192,56 @@ func Mount(rootdir string, label string) ([]Container, error) {
 	return initializeContainers(rootdir, label)
 }
 
-// BuildOverlayOptions constructs overlay mount options for stacking containers.
-// The first path is the base (hostapp), subsequent paths are overlay containers.
-// Returns the mount options string. If options would exceed page size, it stops
-// adding paths and returns what fits.
-func BuildOverlayOptions(basePath string, overlayPaths []string) string {
-	opts := "lowerdir=" + basePath
-	for _, path := range overlayPaths {
-		newOpts := opts + ":" + path
-		if len(newOpts) >= os.Getpagesize()-1 {
+const HOSTOS_BLOCKS_OVERRIDE = "io.balena.image.override"
+
+// OverrideContainer represents an extension that mounts left of the hostapp
+// in the overlayfs lowerdir, giving it higher lookup priority.
+type OverrideContainer struct {
+	MountPath string
+	Name      string
+	Priority  int
+}
+
+// BuildOverlayOptions constructs lowerdir with override extensions before basePath
+// and normal extensions after. Overrides sorted by priority (lower = higher overlayfs priority).
+// basePath is always included. Overrides are added highest-priority-first as space allows,
+// then normal paths. Anything that would exceed page size is dropped with a log warning.
+func BuildOverlayOptions(basePath string, overrides []OverrideContainer, normalPaths []string) string {
+	sort.Slice(overrides, func(i, j int) bool {
+		if overrides[i].Priority != overrides[j].Priority {
+			return overrides[i].Priority < overrides[j].Priority
+		}
+		return overrides[i].Name < overrides[j].Name
+	})
+
+	pageLimit := os.Getpagesize() - 1
+
+	// Phase 1: prepend overrides (highest priority first) while basePath still fits
+	prefix := "lowerdir="
+	included := 0
+	for _, o := range overrides {
+		candidate := prefix + o.MountPath + ":" + basePath
+		if len(candidate) >= pageLimit {
 			break
 		}
-		opts = newOpts
+		prefix += o.MountPath + ":"
+		included++
 	}
+	for _, o := range overrides[included:] {
+		log.Printf("Warning: override extension %q dropped due to page size limit", o.Name)
+	}
+
+	opts := prefix + basePath
+
+	// Phase 2: append normal paths as space allows
+	for _, p := range normalPaths {
+		candidate := opts + ":" + p
+		if len(candidate) >= pageLimit {
+			log.Println("Warning: mount options capped at page size, some extensions dropped")
+			break
+		}
+		opts = candidate
+	}
+
 	return opts
 }

@@ -9,9 +9,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -142,43 +144,57 @@ func mountDataOverlays(newRootPath string) error {
 	}
 
 	containers, err := hostapp.Mount(filepath.Join(newRootPath, string(os.PathSeparator), filepath.Join(DATA_DIR_NAME, string(os.PathSeparator), DATA_LAYER_ROOT)), HOSTOS_BLOCKS_CLASS)
-	if err == nil {
-		mountOptions := fmt.Sprintf("lowerdir=%s", newRootPath)
-		mountType := "overlay"
-		device := "overlay"
-		var mountedContainers []string
-		if len(containers) > 0 {
-			for _, container := range containers {
-				switch container.Config.Driver {
-				case "overlay2":
-					oldMountOptions := mountOptions
-					mountOptions += ":" + container.MountPath
-					// The kernel limits the mount option to PAGE_SIZE-1
-					// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/namespace.c?h=master#n3109
-					if len(mountOptions) >= os.Getpagesize()-1 {
-						mountOptions = oldMountOptions
-						log.Println("Mount options too large - capping at page size")
-						break
-					}
-					mountedContainers = append(mountedContainers, container.Config.Name)
-				default:
-					// aufs does not support nested mounts
-					// https://sourceforge.net/p/aufs/mailman/message/31984065/
-					return fmt.Errorf("Only overlay2 images supported, not %v", container.Config.Driver)
-				}
-			}
+	if err != nil {
+		return err
+	}
 
-			if err := unix.Mount(device, newRootPath, mountType, uintptr(0), mountOptions); err != nil {
-				return fmt.Errorf("Error mounting image: %v", err)
-			}
+	if len(containers) == 0 {
+		return nil
+	}
 
-			log.Println("Overlayed images:")
-			for i, name := range mountedContainers {
-				log.Printf("\t[%d] %s\n", i, name)
+	var overrides []hostapp.OverrideContainer
+	var normalPaths []string
+
+	for _, container := range containers {
+		if container.Config.Driver != "overlay2" {
+			return fmt.Errorf("Only overlay2 images supported, not %v", container.Config.Driver)
+		}
+		if overrideVal, ok := container.Labels[hostapp.HOSTOS_BLOCKS_OVERRIDE]; ok {
+			priority, err := strconv.Atoi(overrideVal)
+			if err != nil {
+				priority = math.MaxInt
+				log.Printf("Warning: container %s has invalid override priority %q, defaulting to lowest", container.Config.Name, overrideVal)
 			}
+			overrides = append(overrides, hostapp.OverrideContainer{
+				MountPath: container.MountPath,
+				Name:      container.Config.Name,
+				Priority:  priority,
+			})
+		} else {
+			normalPaths = append(normalPaths, container.MountPath)
 		}
 	}
-	return err
+
+	mountOptions := hostapp.BuildOverlayOptions(newRootPath, overrides, normalPaths)
+
+	if err := unix.Mount("overlay", newRootPath, "overlay", 0, mountOptions); err != nil {
+		return fmt.Errorf("Error mounting image: %v", err)
+	}
+
+	log.Println("Overlayed images:")
+	idx := 0
+	for _, o := range overrides {
+		log.Printf("\t[%d] %s (override, priority=%d)\n", idx, o.Name, o.Priority)
+		idx++
+	}
+	for _, container := range containers {
+		if _, ok := container.Labels[hostapp.HOSTOS_BLOCKS_OVERRIDE]; !ok {
+			log.Printf("\t[%d] %s (normal)\n", idx, container.Config.Name)
+			idx++
+		}
+	}
+
+	return nil
 }
 
 func prepareForPivot() (string, error) {
@@ -253,7 +269,9 @@ func main() {
 	}
 
 	content, err := os.ReadFile("/proc/cmdline")
-	if err == nil {
+	if err != nil {
+		log.Printf("warning: could not read /proc/cmdline: %v (overlay flags ignored)", err)
+	} else {
 		args := strings.Fields(string(content))
 		for _, arg := range args {
 			if strings.Contains(arg, "emergency") || strings.Contains(arg, CMDLINE_DISABLE_OVERLAYS) {
