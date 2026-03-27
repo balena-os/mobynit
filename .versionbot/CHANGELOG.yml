@@ -1,0 +1,177 @@
+- commits:
+    - subject: "flowzone: add workflow"
+      hash: 44d4b085a07d8eef268147cbd39f2f8b03065624
+      body: ""
+      footer:
+        Change-type: patch
+        change-type: patch
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+  version: 0.2.1
+  title: ""
+  date: 2026-03-27T13:12:41.664Z
+- version: 0.2.0
+  date: 2022-04-22T09:47:04Z
+  commits:
+    - hash: 543ce257b21c2aa9b975f8cc9591cca7a134df60
+      author: Alex Gonzalez
+      footers:
+        change-type: patch
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      subject: "Dockerfile: Add missing git dependancy"
+      body: ""
+    - hash: 446dcd965322418403379176b260c981dca51d72
+      author: Alex Gonzalez
+      footers:
+        change-type: patch
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      subject: "Makefile: Sync build tags with engine"
+      body: This change excludes the devmapper module.
+    - hash: 610b2b81378e087908904d40c98259ae8712d8a0
+      author: Alex Gonzalez
+      footers:
+        change-type: minor
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      subject: Downgrade module dependencies
+      body: >-
+        Currently mobynit is using packages from moby v19.03.12. This hits a
+        crash
+
+        when using it to HUP on x86_64 devices (see balena-os/meta-balena#2589).
+
+        The crash comes as a result of ignoring the following warning at
+        compilation
+
+        time:
+
+        cgo_lookup_unix.go:28: warning: Using 'getpwuid_r' in statically linked
+        applications requires at runtime the shared libraries from the glibc
+        version used for linking
+
+        And it is possibly related to the following unsolved glibc issue with
+
+        static linking: https://sourceware.org/bugzilla/show_bug.cgi?id=19341
+
+        The starting point of the crash is introduced in moby's commit hash:
+
+        fa8dd90ceb7bcb9d554d27e0b9087ab83e54bd2b, in v19.03.1.
+
+        This commit downgrades the moby libraries to before that commit was
+
+        introduced (v19.03.0), avoiding the crash.
+
+        Fixes balena-os/meta-balena#2589
+    - hash: 7d6532b253562eae2a907b8f19f7e4dfd1217f59
+      author: Kyle Harding
+      footers:
+        signed-off-by: Kyle Harding <kyle@balena.io>
+      subject: Add linux-headers to docker build
+      body: ""
+    - hash: eccec4caaee1d5a6dafcae4d1a8b58975d0cc106
+      author: Kyle Harding
+      footers:
+        signed-off-by: Kyle Harding <kyle@balena.io>
+      subject: Downgrade golang:alpine image to avoid balenCI errors
+      body: https://wiki.alpinelinux.org/wiki/Release_Notes_for_Alpine_3.14.0#faccessat2
+    - hash: db8d7a18571c156091701e74de7d10dffca77309
+      author: Kyle Harding
+      footers:
+        signed-off-by: Kyle Harding <kyle@balena.io>
+      subject: Add gitignore
+      body: ""
+- version: 0.1.2
+  date: 2021-04-22T12:24:44Z
+  commits:
+    - hash: e3cfd8ca17671a038bd833c06ad146af35f1e4e6
+      author: Alex Gonzalez
+      footers:
+        change-type: patch
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      subject: "Makefile: Remove disabling cgo"
+      body: |-
+        CGO is required when cross-compiling mobyinit, so with CGO_ENABLED=0 the
+        Yocto builds fail.
+        This commit removes the CGO_ENABLED=0 and add the requires dependencies
+        to the CI container to use CGO.
+- version: 0.1.1
+  date: 2021-04-21T16:57:12Z
+  commits:
+    - hash: f274f0658c23ed364d656d6005e9557cf2490c75
+      author: Alex Gonzalez
+      footers:
+        change-type: patch
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      subject: "Dockerfile: Remove hostapp.test from artifacts"
+      body: Leave only the mobynit binary as release artifacts.
+- version: 0.1.0
+  date: 2021-04-21T16:20:57Z
+  commits:
+    - hash: 044961425fb0d4f1e44e8ea62c9fa0174a7d0dac
+      author: Alex Gonzalez
+      footers:
+        change-type: patch
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      subject: "mobynit: Refer to overlay images instead of host extensions"
+      body: |-
+        Further discussions in the context of a multi container hostOS has
+        changed the terminology. What was referred to as host extensions are now
+        overlay images that go into the data store.
+        This commit changes the terminology used with variables and functions
+        renames without functional changes.
+    - hash: 47f7436458eee138e9447c603ea863d1e216c137
+      author: Alex Gonzalez
+      footers:
+        relates-to: balena-io/pull/2376
+        change-type: minor
+        changelog-entry: Use image overlay labels
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      subject: "mobyinit: Use the new image labels instead of a feature label"
+      body: >-
+        In the context of the multi container hostOS architecture, the different
+
+        images that form the hostOS have been labeled, and what used to be
+        referred
+
+        to as host extensions are now overlay images defined with the following
+
+        image label:
+
+        io.balena.image.class: overlay
+
+        This commit modifies mobyinit to match for images with that label.
+- version: 0.0.4
+  date: 2021-04-21T15:48:18Z
+  commits:
+    - hash: eb05dc06cf8cedb510f8044bb60d4fc2b21d7cef
+      author: Alex Gonzalez
+      footers:
+        change-type: patch
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      subject: "build-in-container: Add tests to build pipeline"
+      body: These changes build and execute the hostapp_test tests.
+- version: 0.0.3
+  date: 2021-04-21T12:40:42Z
+  commits:
+    - hash: e6f298324ec5841f0e13b8eb37b2c93e50e27507
+      author: Alex Gonzalez
+      footers:
+        change-type: patch
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      subject: "build-docker: Make executable"
+      body: |-
+        The build-docker script will be executed by the CI so it needs to be
+        executable.
+- version: 0.0.2
+  date: 2020-12-09T19:18:07Z
+  commits:
+    - hash: 8f8300605116d94e15a121c450f0149a8cf48dc9
+      author: Alex Gonzalez
+      footers:
+        change-type: patch
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      subject: "main: Mount resin-data in /mnt/data for backwards compatibility"
+      body: |-
+        The /resin-data directory is a bind mount into /mnt/data/resin-data.
+        Fixes https://github.com/balena-os/meta-balena/issues/2070
