@@ -17,7 +17,7 @@ RUN --mount=target=. \
 FROM scratch AS final
 COPY --from=gobuild /out/mobynit /
 
-FROM docker:19.03-dind AS testimage
+FROM docker:25-dind AS testimage
 RUN apk add --no-cache bash sudo util-linux
 WORKDIR /src
 VOLUME /var/lib/docker
