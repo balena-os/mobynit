@@ -311,11 +311,11 @@ func TestMountVerifiesOverlayWorks(t *testing.T) {
 // TestBuildOverlayOptions tests the mount options string construction.
 func TestBuildOverlayOptions(t *testing.T) {
 	tests := []struct {
-		name        string
-		basePath    string
-		overrides   []OverrideContainer
-		normalPaths []string
-		expected    string
+		name            string
+		basePath        string
+		leftExtensions  []Extension
+		rightExtensions []Extension
+		expected        string
 	}{
 		{
 			name:     "base only",
@@ -323,51 +323,57 @@ func TestBuildOverlayOptions(t *testing.T) {
 			expected: "lowerdir=/base",
 		},
 		{
-			name:        "normals only",
-			basePath:    "/base",
-			normalPaths: []string{"/n1", "/n2"},
-			expected:    "lowerdir=/base:/n1:/n2",
+			name:     "rights only",
+			basePath: "/base",
+			rightExtensions: []Extension{
+				{MountPath: "/n1", Name: "right1"},
+				{MountPath: "/n2", Name: "right2"},
+			},
+			expected: "lowerdir=/base:/n1:/n2",
 		},
 		{
-			name:     "single override",
+			name:     "single left",
 			basePath: "/base",
-			overrides: []OverrideContainer{
-				{MountPath: "/o1", Name: "override1", Priority: 10},
+			leftExtensions: []Extension{
+				{MountPath: "/o1", Name: "left1", Priority: 10},
 			},
 			expected: "lowerdir=/o1:/base",
 		},
 		{
-			name:     "override sorting",
+			name:     "left sorting",
 			basePath: "/base",
-			overrides: []OverrideContainer{
-				{MountPath: "/o2", Name: "override2", Priority: 50},
-				{MountPath: "/o1", Name: "override1", Priority: 10},
+			leftExtensions: []Extension{
+				{MountPath: "/o2", Name: "left2", Priority: 50},
+				{MountPath: "/o1", Name: "left1", Priority: 10},
 			},
 			expected: "lowerdir=/o1:/o2:/base",
 		},
 		{
 			name:     "equal priority tie-break by name",
 			basePath: "/base",
-			overrides: []OverrideContainer{
+			leftExtensions: []Extension{
 				{MountPath: "/zz", Name: "zulu", Priority: 10},
 				{MountPath: "/aa", Name: "alpha", Priority: 10},
 			},
 			expected: "lowerdir=/aa:/zz:/base",
 		},
 		{
-			name:     "both groups",
+			name:     "both sides",
 			basePath: "/base",
-			overrides: []OverrideContainer{
-				{MountPath: "/o1", Name: "override1", Priority: 10},
+			leftExtensions: []Extension{
+				{MountPath: "/o1", Name: "left1", Priority: 10},
 			},
-			normalPaths: []string{"/n1", "/n2"},
-			expected:    "lowerdir=/o1:/base:/n1:/n2",
+			rightExtensions: []Extension{
+				{MountPath: "/n1", Name: "right1"},
+				{MountPath: "/n2", Name: "right2"},
+			},
+			expected: "lowerdir=/o1:/base:/n1:/n2",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := BuildOverlayOptions(tt.basePath, tt.overrides, tt.normalPaths)
+			result := BuildOverlayOptions(tt.basePath, tt.leftExtensions, tt.rightExtensions)
 			if result != tt.expected {
 				t.Errorf("expected %q, got %q", tt.expected, result)
 			}
@@ -382,90 +388,96 @@ func TestBuildOverlayOptionsTruncation(t *testing.T) {
 	// Create a long base path that leaves limited room
 	basePath := "/" + strings.Repeat("b", pageSize/3)
 
-	// Override should be included before base
-	override := OverrideContainer{
+	// Left extension should be included before base
+	left := Extension{
 		MountPath: "/" + strings.Repeat("o", pageSize/3),
-		Name:      "override",
+		Name:      "left",
 		Priority:  10,
 	}
 
-	// Normal paths that would exceed page size
-	normalLong := "/" + strings.Repeat("n", pageSize/3)
+	// Right extension that would exceed page size
+	rightLong := Extension{
+		MountPath: "/" + strings.Repeat("n", pageSize/3),
+		Name:      "right",
+	}
 
-	result := BuildOverlayOptions(basePath, []OverrideContainer{override}, []string{normalLong})
+	result := BuildOverlayOptions(basePath, []Extension{left}, []Extension{rightLong})
 
-	// Override and base must be present
-	if !strings.Contains(result, override.MountPath) {
-		t.Error("override path missing from result")
+	// Left extension and base must be present
+	if !strings.Contains(result, left.MountPath) {
+		t.Error("left extension path missing from result")
 	}
 	if !strings.Contains(result, basePath) {
 		t.Error("base path missing from result")
 	}
 
-	// Normal path should be truncated (total would exceed page size)
-	if strings.Contains(result, normalLong) {
-		t.Error("normal path should have been truncated due to page size limit")
+	// Right extension should be truncated (total would exceed page size)
+	if strings.Contains(result, rightLong.MountPath) {
+		t.Error("right extension path should have been truncated due to page size limit")
 	}
 
 	if len(result) >= pageSize-1 {
 		t.Errorf("result length %d exceeds page size limit %d", len(result), pageSize-1)
 	}
 
-	// Verify override is dropped (not basePath) when override + basePath exceed page size
-	hugeOverride := OverrideContainer{
+	// Verify left extension is dropped (not basePath) when it + basePath exceed page size
+	hugeLeft := Extension{
 		MountPath: "/" + strings.Repeat("x", pageSize),
 		Name:      "huge",
 		Priority:  1,
 	}
-	degraded := BuildOverlayOptions("/base", []OverrideContainer{hugeOverride}, nil)
+	degraded := BuildOverlayOptions("/base", []Extension{hugeLeft}, nil)
 	if !strings.Contains(degraded, "/base") {
-		t.Error("basePath must always be present even when overrides exceed page size")
+		t.Error("basePath must always be present even when left extensions exceed page size")
 	}
-	if strings.Contains(degraded, hugeOverride.MountPath) {
-		t.Error("huge override should have been dropped")
+	if strings.Contains(degraded, hugeLeft.MountPath) {
+		t.Error("huge left extension should have been dropped")
 	}
 
-	// Partial override truncation: 3 overrides where only first 2 fit with basePath.
+	// Partial left truncation: 3 left extensions where only first 2 fit with basePath.
 	// Each path is ~1/3 of available space so 3 paths fit but 4 don't.
 	third := (pageSize - len("lowerdir=") - 3) / 3 // 3 paths + 2 colons fit
-	overrides := []OverrideContainer{
+	lefts := []Extension{
 		{MountPath: "/" + strings.Repeat("a", third-1), Name: "first", Priority: 1},
 		{MountPath: "/" + strings.Repeat("b", third-1), Name: "second", Priority: 2},
 		{MountPath: "/" + strings.Repeat("c", third-1), Name: "third", Priority: 3},
 	}
 	shortBase := "/" + strings.Repeat("z", third-1)
-	partial := BuildOverlayOptions(shortBase, overrides, nil)
-	if !strings.Contains(partial, overrides[0].MountPath) {
-		t.Error("highest-priority override should be present")
+	partial := BuildOverlayOptions(shortBase, lefts, nil)
+	if !strings.Contains(partial, lefts[0].MountPath) {
+		t.Error("highest-priority left extension should be present")
 	}
-	if !strings.Contains(partial, overrides[1].MountPath) {
-		t.Error("second-priority override should be present")
+	if !strings.Contains(partial, lefts[1].MountPath) {
+		t.Error("second-priority left extension should be present")
 	}
 	if !strings.Contains(partial, shortBase) {
 		t.Error("basePath must always be present")
 	}
-	if strings.Contains(partial, overrides[2].MountPath) {
-		t.Error("third override should have been dropped due to page size")
+	if strings.Contains(partial, lefts[2].MountPath) {
+		t.Error("third left extension should have been dropped due to page size")
 	}
 
-	// Normals dropped before overrides: one override + basePath nearly fill the
-	// budget, normal should be dropped while override stays
-	almostFull := OverrideContainer{
+	// Right extensions dropped before left extensions: one left + basePath nearly
+	// fill the budget, right should be dropped while left stays
+	almostFull := Extension{
 		MountPath: "/" + strings.Repeat("o", pageSize/2),
-		Name:      "big-override",
+		Name:      "big-left",
 		Priority:  1,
 	}
 	mediumBase := "/" + strings.Repeat("b", pageSize/4)
-	normalPath := "/" + strings.Repeat("n", pageSize/4)
-	mixed := BuildOverlayOptions(mediumBase, []OverrideContainer{almostFull}, []string{normalPath})
+	rightExt := Extension{
+		MountPath: "/" + strings.Repeat("n", pageSize/4),
+		Name:      "right",
+	}
+	mixed := BuildOverlayOptions(mediumBase, []Extension{almostFull}, []Extension{rightExt})
 	if !strings.Contains(mixed, almostFull.MountPath) {
-		t.Error("override should be present")
+		t.Error("left extension should be present")
 	}
 	if !strings.Contains(mixed, mediumBase) {
 		t.Error("basePath must always be present")
 	}
-	if strings.Contains(mixed, normalPath) {
-		t.Error("normal should have been dropped since override + base already near limit")
+	if strings.Contains(mixed, rightExt.MountPath) {
+		t.Error("right extension should have been dropped since left + base already near limit")
 	}
 }
 
@@ -522,13 +534,13 @@ func TestOverlayStacking(t *testing.T) {
 	// Step 3: Create stacked overlay mount
 	stackedMount := t.TempDir()
 
-	overlayPaths := make([]string, len(osBlocks))
+	rightExtensions := make([]Extension, len(osBlocks))
 	for i, c := range osBlocks {
-		overlayPaths[i] = c.MountPath
+		rightExtensions[i] = Extension{Name: c.Name, MountPath: c.MountPath}
 		t.Logf("OS block %d: %s at %s", i, c.Name, c.MountPath)
 	}
 
-	opts := BuildOverlayOptions(hostappPath, nil, overlayPaths)
+	opts := BuildOverlayOptions(hostappPath, nil, rightExtensions)
 	t.Logf("Mount options: %s", opts)
 
 	if err := unix.Mount("overlay", stackedMount, "overlay", 0, opts); err != nil {

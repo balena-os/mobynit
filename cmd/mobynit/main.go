@@ -152,8 +152,7 @@ func mountDataOverlays(newRootPath string) error {
 		return nil
 	}
 
-	var overrides []hostapp.OverrideContainer
-	var normalPaths []string
+	var leftExtensions, rightExtensions []hostapp.Extension
 
 	for _, container := range containers {
 		if container.Config.Driver != "overlay2" {
@@ -165,33 +164,23 @@ func mountDataOverlays(newRootPath string) error {
 				priority = math.MaxInt
 				log.Printf("Warning: container %s has invalid override priority %q, defaulting to lowest", container.Config.Name, overrideVal)
 			}
-			overrides = append(overrides, hostapp.OverrideContainer{
-				MountPath: container.MountPath,
+			leftExtensions = append(leftExtensions, hostapp.Extension{
 				Name:      container.Config.Name,
+				MountPath: container.MountPath,
 				Priority:  priority,
 			})
 		} else {
-			normalPaths = append(normalPaths, container.MountPath)
+			rightExtensions = append(rightExtensions, hostapp.Extension{
+				Name:      container.Config.Name,
+				MountPath: container.MountPath,
+			})
 		}
 	}
 
-	mountOptions := hostapp.BuildOverlayOptions(newRootPath, overrides, normalPaths)
+	mountOptions := hostapp.BuildOverlayOptions(newRootPath, leftExtensions, rightExtensions)
 
 	if err := unix.Mount("overlay", newRootPath, "overlay", 0, mountOptions); err != nil {
 		return fmt.Errorf("Error mounting image: %v", err)
-	}
-
-	log.Println("Overlayed images:")
-	idx := 0
-	for _, o := range overrides {
-		log.Printf("\t[%d] %s (override, priority=%d)\n", idx, o.Name, o.Priority)
-		idx++
-	}
-	for _, container := range containers {
-		if _, ok := container.Labels[hostapp.HOSTOS_BLOCKS_OVERRIDE]; !ok {
-			log.Printf("\t[%d] %s (normal)\n", idx, container.Config.Name)
-			idx++
-		}
 	}
 
 	return nil

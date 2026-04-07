@@ -194,53 +194,81 @@ func Mount(rootdir string, label string) ([]Container, error) {
 
 const HOSTOS_BLOCKS_OVERRIDE = "io.balena.image.override"
 
-// OverrideContainer represents an extension that mounts left of the hostapp
-// in the overlayfs lowerdir, giving it higher lookup priority.
-type OverrideContainer struct {
-	MountPath string
+// Extension represents an OS-block overlay extension. Extensions passed in
+// the leftExtensions slice of BuildOverlayOptions mount left of the hostapp
+// in lowerdir at their Priority (lower = higher overlayfs precedence, ties
+// broken by Name). Extensions passed in rightExtensions mount right of the
+// hostapp; their Priority field is ignored.
+type Extension struct {
 	Name      string
+	MountPath string
 	Priority  int
 }
 
-// BuildOverlayOptions constructs lowerdir with override extensions before basePath
-// and normal extensions after. Overrides sorted by priority (lower = higher overlayfs priority).
-// basePath is always included. Overrides are added highest-priority-first as space allows,
-// then normal paths. Anything that would exceed page size is dropped with a log warning.
-func BuildOverlayOptions(basePath string, overrides []OverrideContainer, normalPaths []string) string {
-	sort.Slice(overrides, func(i, j int) bool {
-		if overrides[i].Priority != overrides[j].Priority {
-			return overrides[i].Priority < overrides[j].Priority
+// BuildOverlayOptions constructs an overlay lowerdir mount options string.
+// leftExtensions mount left of basePath (taking overlayfs precedence over it)
+// sorted by Priority ascending with Name as tie-breaker. rightExtensions mount
+// right of basePath in the order given. basePath is always included.
+//
+// Extensions that would push the options string past the kernel page-size
+// limit are dropped: rightExtensions first, then the lowest-priority
+// leftExtensions. Drops are logged per name. The set of extensions that fit
+// is logged in mount order.
+func BuildOverlayOptions(basePath string, leftExtensions, rightExtensions []Extension) string {
+	sort.Slice(leftExtensions, func(i, j int) bool {
+		if leftExtensions[i].Priority != leftExtensions[j].Priority {
+			return leftExtensions[i].Priority < leftExtensions[j].Priority
 		}
-		return overrides[i].Name < overrides[j].Name
+		return leftExtensions[i].Name < leftExtensions[j].Name
 	})
 
 	pageLimit := os.Getpagesize() - 1
 
-	// Phase 1: prepend overrides (highest priority first) while basePath still fits
+	// Phase 1: prepend leftExtensions (highest priority first) while basePath still fits
 	prefix := "lowerdir="
-	included := 0
-	for _, o := range overrides {
-		candidate := prefix + o.MountPath + ":" + basePath
+	leftIncluded := 0
+	for _, e := range leftExtensions {
+		candidate := prefix + e.MountPath + ":" + basePath
 		if len(candidate) >= pageLimit {
 			break
 		}
-		prefix += o.MountPath + ":"
-		included++
+		prefix += e.MountPath + ":"
+		leftIncluded++
 	}
-	for _, o := range overrides[included:] {
-		log.Printf("Warning: override extension %q dropped due to page size limit", o.Name)
+	for _, e := range leftExtensions[leftIncluded:] {
+		log.Printf("Warning: extension %q dropped due to page size limit", e.Name)
 	}
 
 	opts := prefix + basePath
 
-	// Phase 2: append normal paths as space allows
-	for _, p := range normalPaths {
-		candidate := opts + ":" + p
+	// Phase 2: append rightExtensions as space allows
+	rightIncluded := 0
+	for _, e := range rightExtensions {
+		candidate := opts + ":" + e.MountPath
 		if len(candidate) >= pageLimit {
-			log.Println("Warning: mount options capped at page size, some extensions dropped")
 			break
 		}
 		opts = candidate
+		rightIncluded++
+	}
+	for _, e := range rightExtensions[rightIncluded:] {
+		log.Printf("Warning: extension %q dropped due to page size limit", e.Name)
+	}
+
+	// Log what fit, in mount order
+	log.Println("Overlayed images:")
+	idx := 0
+	for i := 0; i < leftIncluded; i++ {
+		e := leftExtensions[i]
+		log.Printf("\t[%d] %s (left, priority=%d)", idx, e.Name, e.Priority)
+		idx++
+	}
+	log.Printf("\t[%d] %s (hostapp)", idx, basePath)
+	idx++
+	for i := 0; i < rightIncluded; i++ {
+		e := rightExtensions[i]
+		log.Printf("\t[%d] %s (right)", idx, e.Name)
+		idx++
 	}
 
 	return opts
