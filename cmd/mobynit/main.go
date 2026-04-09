@@ -5,21 +5,81 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
-	"github.com/docker/docker/pkg/mount"
 	"golang.org/x/sys/unix"
 
 	"github.com/balena-os/hostapp"
 )
+
+// MountInfo represents a mount point from /proc/self/mountinfo
+type MountInfo struct {
+	Mountpoint string
+}
+
+// getMounts parses /proc/self/mountinfo and returns mount points
+func getMounts() ([]MountInfo, error) {
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var mounts []MountInfo
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		// mountinfo format: ID PARENT_ID MAJOR:MINOR ROOT MOUNTPOINT OPTIONS...
+		// Fields are space-separated, mountpoint is field 5 (index 4)
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 5 {
+			continue
+		}
+		// Unescape octal sequences in mountpoint (e.g., \040 for space)
+		mountpoint := unescapeMountpoint(fields[4])
+		mounts = append(mounts, MountInfo{Mountpoint: mountpoint})
+	}
+	return mounts, scanner.Err()
+}
+
+// unescapeMountpoint handles octal escape sequences in mountinfo
+// Escaped chars: space(\040), tab(\011), newline(\012), backslash(\134)
+func unescapeMountpoint(s string) string {
+	if strings.IndexByte(s, '\\') == -1 {
+		return s
+	}
+
+	buf := make([]byte, len(s))
+	bufLen := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' || i+3 >= len(s) {
+			buf[bufLen] = s[i]
+			bufLen++
+			continue
+		}
+		// Check for valid octal escape \NNN
+		c1, c2, c3 := s[i+1], s[i+2], s[i+3]
+		if c1 >= '0' && c1 <= '7' && c2 >= '0' && c2 <= '7' && c3 >= '0' && c3 <= '7' {
+			v := (c1-'0')<<6 | (c2-'0')<<3 | (c3 - '0')
+			buf[bufLen] = v
+			bufLen++
+			i += 3
+		} else {
+			buf[bufLen] = s[i]
+			bufLen++
+		}
+	}
+	return string(buf[:bufLen])
+}
 
 const (
 	HOSTAPP_LAYER_ROOT       = "balena"
@@ -27,10 +87,11 @@ const (
 	HOSTOS_BLOCKS_CLASS      = "io.balena.image.class"
 	LOG_DIR                  = "/tmp/initramfs/"
 	LOG_FILE                 = "initramfs.debug"
-	CMDLINE_DISABLE_OVERLAYS = "balena.disable_overlays"
+	CMDLINE_DISABLE_OVERLAYS = "mobynit.no_overlays"
 	DATA_DIR_NAME            = "/mnt/data"
 	DATA_STATE_NAME          = "resin-data"
 	DATA_LAYER_ROOT          = "docker"
+	PURGE_MARKER_FILE        = "remove_me_to_reset"
 )
 
 /* Do not overlay images */
@@ -68,49 +129,61 @@ func mountDataOverlays(newRootPath string) error {
 	}
 	// As the /dev mount was moved this cannot be used directly
 	device = filepath.Join("/dev", string(os.PathSeparator), path.Base(device))
-	err = unix.Mount(device, filepath.Join(newRootPath, string(os.PathSeparator), DATA_DIR_NAME), dataFstype, 0, "")
+	dataMountPath := filepath.Join(newRootPath, string(os.PathSeparator), DATA_DIR_NAME)
+	err = unix.Mount(device, dataMountPath, dataFstype, 0, "")
 	if err != nil {
 		return fmt.Errorf("Error mounting data partition: %v", err)
 	}
 
+	// Check for pending purge - if remove_me_to_reset is missing,
+	// data partition will be wiped after boot, so skip extension mounting
+	purgeMarker := filepath.Join(dataMountPath, PURGE_MARKER_FILE)
+	if _, err := os.Stat(purgeMarker); os.IsNotExist(err) {
+		log.Println("Purge pending: remove_me_to_reset missing, skipping extension overlays")
+		return nil
+	}
+
 	containers, err := hostapp.Mount(filepath.Join(newRootPath, string(os.PathSeparator), filepath.Join(DATA_DIR_NAME, string(os.PathSeparator), DATA_LAYER_ROOT)), HOSTOS_BLOCKS_CLASS)
-	if err == nil {
-		mountOptions := fmt.Sprintf("lowerdir=%s", newRootPath)
-		mountType := "overlay"
-		device := "overlay"
-		var mountedContainers []string
-		if len(containers) > 0 {
-			for _, container := range containers {
-				switch container.Config.Driver {
-				case "overlay2":
-					oldMountOptions := mountOptions
-					mountOptions += filepath.Join(string(os.PathListSeparator), container.MountPath)
-					// The kernel limits the mount option to PAGE_SIZE-1
-					// https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/namespace.c?h=master#n3109
-					if len(mountOptions) >= os.Getpagesize()-1 {
-						mountOptions = oldMountOptions
-						log.Println("Mount options too large - capping at page size")
-						break
-					}
-					mountedContainers = append(mountedContainers, container.Config.Name)
-				default:
-					// aufs does not support nested mounts
-					// https://sourceforge.net/p/aufs/mailman/message/31984065/
-					return fmt.Errorf("Only overlay2 images supported, not %v", container.Config.Driver)
-				}
-			}
+	if err != nil {
+		return err
+	}
 
-			if err := unix.Mount(device, newRootPath, mountType, uintptr(0), mountOptions); err != nil {
-				return fmt.Errorf("Error mounting image: %v", err)
-			}
+	if len(containers) == 0 {
+		return nil
+	}
 
-			log.Println("Overlayed images:")
-			for i, name := range mountedContainers {
-				log.Printf("\t[%d] %s\n", i, name)
+	var leftExtensions, rightExtensions []hostapp.Extension
+
+	for _, container := range containers {
+		if container.Config.Driver != "overlay2" {
+			return fmt.Errorf("Only overlay2 images supported, not %v", container.Config.Driver)
+		}
+		if overrideVal, ok := container.Labels[hostapp.HOSTOS_BLOCKS_OVERRIDE]; ok {
+			priority, err := strconv.Atoi(overrideVal)
+			if err != nil {
+				priority = math.MaxInt
+				log.Printf("Warning: container %s has invalid override priority %q, defaulting to lowest", container.Config.Name, overrideVal)
 			}
+			leftExtensions = append(leftExtensions, hostapp.Extension{
+				Name:      container.Config.Name,
+				MountPath: container.MountPath,
+				Priority:  priority,
+			})
+		} else {
+			rightExtensions = append(rightExtensions, hostapp.Extension{
+				Name:      container.Config.Name,
+				MountPath: container.MountPath,
+			})
 		}
 	}
-	return err
+
+	mountOptions := hostapp.BuildOverlayOptions(newRootPath, leftExtensions, rightExtensions)
+
+	if err := unix.Mount("overlay", newRootPath, "overlay", 0, mountOptions); err != nil {
+		return fmt.Errorf("Error mounting image: %v", err)
+	}
+
+	return nil
 }
 
 func prepareForPivot() (string, error) {
@@ -184,8 +257,10 @@ func main() {
 		log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 	}
 
-	content, err := ioutil.ReadFile("/proc/cmdline")
-	if err == nil {
+	content, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		log.Printf("warning: could not read /proc/cmdline: %v (overlay flags ignored)", err)
+	} else {
 		args := strings.Fields(string(content))
 		for _, arg := range args {
 			if strings.Contains(arg, "emergency") || strings.Contains(arg, CMDLINE_DISABLE_OVERLAYS) {
@@ -195,7 +270,7 @@ func main() {
 	}
 
 	// Any mounts done by initrd will be transfered in the new root
-	mounts, err := mount.GetMounts(nil)
+	mounts, err := getMounts()
 	if err != nil {
 		log.Fatalln("could not get mounts:", err)
 	}
@@ -209,12 +284,12 @@ func main() {
 		log.Fatalln("Error preparing for pivot root:", err)
 	}
 
-	for _, mount := range mounts {
-		if mount.Mountpoint == "/" {
+	for _, m := range mounts {
+		if m.Mountpoint == "/" {
 			continue
 		}
-		if err := unix.Mount(mount.Mountpoint, filepath.Join(newRoot, mount.Mountpoint), "", unix.MS_MOVE, ""); err != nil {
-			log.Println("could not move mountpoint:", mount.Mountpoint, err)
+		if err := unix.Mount(m.Mountpoint, filepath.Join(newRoot, m.Mountpoint), "", unix.MS_MOVE, ""); err != nil {
+			log.Println("could not move mountpoint:", m.Mountpoint, err)
 		}
 	}
 
