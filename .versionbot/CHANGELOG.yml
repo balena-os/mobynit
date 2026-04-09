@@ -1,4 +1,78 @@
 - commits:
+    - subject: "hostapp: implement override mount priority"
+      hash: d3c16a06af5c69c7384260b7c8ca670abaf235ca
+      body: |
+        io.balena.image.override=N lets an extension mount left of the hostapp,
+        so it replaces hostapp files instead of just extending it.
+
+        N orders overrides among themselves (lower = higher priority).
+        Extensions without the label stay right of the hostapp as additive-only.
+      footer:
+        Change-type: patch
+        change-type: patch
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+    - subject: "hostapp: skipt containers flagged as to be removed"
+      hash: bf12f6d5ab76455af97e3204ec573adc047d27cc
+      body: |
+        The the OS removes an extension it flags it for removal so the next OS
+        run can remove it. Mobynit must not mount these to be removed images.
+      footer:
+        Change-type: patch
+        change-type: patch
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+    - subject: "main: replace balena.disable_overlays with mobynit.no_overlays"
+      hash: 5e37fbbbdf3d3db365919821c303a542ec3e2490
+      body: |
+        Prefer to use the mobynit prefix which is more concrete.
+      footer:
+        Change-type: patch
+        change-type: patch
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+    - subject: "hostapp: skip init layers in overlay"
+      hash: 512a2c07876e6282c1e1df8f5976e6941bc6eac7
+      body: |
+        This avoids the docker scaffolding that makes systemd think it's booting
+        a container.
+      footer:
+        Change-type: patch
+        change-type: patch
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+    - subject: Replace Docker packages with direct overlay2 metadata access
+      hash: 158e1c17f97977958f93ef201ce7bcdb8517b4a2
+      body: |
+        Eliminates dependency on Docker's internal Go packages by reading
+        overlay2 filesystem metadata directly - a stable ABI.
+
+        This decouples mobynit from Docker version changes,
+        reduces binary size from ~15MB to ~3MB,
+        and simplifies the mount mechanism to a single flat overlay instead
+        of nested mounts.
+
+        Tests validate the implementation against real balena hostapps and
+        OS block containers pulled from bhcr.io.
+      footer:
+        Change-type: major
+        change-type: major
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+  version: 1.0.0
+  title: ""
+  date: 2026-04-09T13:16:41.064Z
+- commits:
     - subject: "flowzone: add workflow"
       hash: 44d4b085a07d8eef268147cbd39f2f8b03065624
       body: ""
