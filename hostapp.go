@@ -1,8 +1,11 @@
 package hostapp
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -34,6 +37,7 @@ type Config struct {
 type Container struct {
 	Config
 	MountPath string
+	HomePath  string
 }
 
 var (
@@ -115,6 +119,22 @@ func (container *Container) mount(layerRoot string) (string, error) {
 	return container.MountPath, nil
 }
 
+// unmount releases the container's overlay filesystem. It is a no-op for a
+// container that was never mounted (MountPath == "").
+func (container *Container) unmount() error {
+	if container.MountPath == "" {
+		return nil
+	}
+	if err := unix.Unmount(container.MountPath, 0); err != nil {
+		return fmt.Errorf("unmounting %s: %w", container.MountPath, err)
+	}
+	if Debug {
+		log.Printf("Unmounted ID %s from %s", container.ID, container.MountPath)
+	}
+	container.MountPath = ""
+	return nil
+}
+
 // initialize reads container config
 func (container *Container) initialize(homePath string) error {
 	configPath := filepath.Join(homePath, "config.v2.json")
@@ -127,6 +147,7 @@ func (container *Container) initialize(homePath string) error {
 	if err := json.NewDecoder(f).Decode(&container.Config); err != nil {
 		return fmt.Errorf("decoding %s: %w", configPath, err)
 	}
+	container.HomePath = homePath
 	if Verbose || Debug {
 		log.Println("Initialized container:", container.Config.Name)
 	}
@@ -192,7 +213,178 @@ func Mount(rootdir string, label string) ([]Container, error) {
 	return initializeContainers(rootdir, label)
 }
 
-const HOSTOS_BLOCKS_OVERRIDE = "io.balena.image.override"
+const (
+	HOSTOS_BLOCKS_OVERRIDE       = "io.balena.image.override"
+	HOSTOS_BLOCKS_KERNEL_VERSION = "io.balena.image.kernel-version"
+	HOSTOS_BLOCKS_KERNEL_ABI_ID  = "io.balena.image.kernel-abi-id"
+	CMDLINE_KERNEL_ABI           = "balena_kernel_abi"
+)
+
+// ParseHostKernelABIID extracts the balena_kernel_abi=<value> token from a
+// kernel cmdline string and returns its value. Returns "" when the token is
+// absent or carries an empty value, i.e. when the boot path ran a stock
+// kernel whose ABI is not knowable.
+func ParseHostKernelABIID(cmdline string) string {
+	prefix := CMDLINE_KERNEL_ABI + "="
+	for _, tok := range strings.Fields(cmdline) {
+		if v, ok := strings.CutPrefix(tok, prefix); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// GetKernelRelease returns the running kernel's full release string
+// (e.g. "6.8.0-100-generic"), as reported by uname(2).
+func GetKernelRelease() (string, error) {
+	var utsname unix.Utsname
+	if err := unix.Uname(&utsname); err != nil {
+		return "", fmt.Errorf("uname syscall failed: %w", err)
+	}
+	return unix.ByteSliceToString(utsname.Release[:]), nil
+}
+
+// kernelVersionFromRelease strips the local-version suffix (e.g. "-100-generic",
+// "-v8+") from a uname release, leaving the M.m.p version that kernel-version
+// compatibility tracks. An empty release yields an empty version.
+func kernelVersionFromRelease(release string) string {
+	if idx := strings.IndexByte(release, '-'); idx > 0 {
+		return release[:idx]
+	}
+	return release
+}
+
+// FilterByKernelVersion removes containers whose kernel-version label
+// doesn't match the running kernel. Containers without the label always pass.
+// An empty kernelVersion disables filtering.
+func FilterByKernelVersion(containers []Container, kernelVersion string) []Container {
+	if kernelVersion == "" {
+		return containers
+	}
+	var filtered []Container
+	for _, c := range containers {
+		if labelVal, ok := c.Labels[HOSTOS_BLOCKS_KERNEL_VERSION]; ok && labelVal != kernelVersion {
+			log.Printf("Skipping container %s: kernel version %q != running %q", c.Name, labelVal, kernelVersion)
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	return filtered
+}
+
+// ComputeABIID returns the hex-encoded sha256 of the file at path.
+// Used to derive io.balena.image.kernel-abi-id from Module.symvers.
+func ComputeABIID(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("opening %s: %w", path, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("hashing %s: %w", path, err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// ResolveExtensionABIID computes the container's kernel ABI ID as
+// sha256(<mount>/lib/modules/<release>/Module.symvers), where release is the
+// running kernel's uname release.
+//
+// Returns "" with no error if the extension carries no kernel modules for the
+// running release. Returns an error if /lib/modules/<release> exists
+// but Module.symvers is missing (broken extension), if the label disagrees with
+// the computed value, or if a module-carrying extension cannot be verified
+// because release is empty (running kernel unknown).
+func (c *Container) ResolveExtensionABIID(release string) (string, error) {
+	if c.MountPath == "" {
+		return "", nil
+	}
+
+	modulesRoot := filepath.Join(c.MountPath, "lib", "modules")
+	if _, err := os.Stat(modulesRoot); err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("stat %s: %w", modulesRoot, err)
+	}
+
+	if release == "" {
+		return "", fmt.Errorf("extension %s: running kernel release unknown", c.Name)
+	}
+	modDir := filepath.Join(modulesRoot, release)
+	if _, err := os.Stat(modDir); err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("stat %s: %w", modDir, err)
+	}
+	symversPath := filepath.Join(modDir, "Module.symvers")
+	if _, err := os.Stat(symversPath); err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("broken extension %s: %s missing", c.Name, symversPath)
+		}
+		return "", fmt.Errorf("stat %s: %w", symversPath, err)
+	}
+	id, err := ComputeABIID(symversPath)
+	if err != nil {
+		return "", err
+	}
+	if labelVal, ok := c.Labels[HOSTOS_BLOCKS_KERNEL_ABI_ID]; ok && labelVal != "" && labelVal != id {
+		return "", fmt.Errorf("extension %s: %s label %q != computed %q",
+			c.Name, HOSTOS_BLOCKS_KERNEL_ABI_ID, labelVal, id)
+	}
+	return id, nil
+}
+
+// FilterByKernelABIID keeps only those containers safe to mount over the
+// running kernel.
+//
+// An ABI-agnostic extension makes no kernel-ABI claim and always passes.
+// A kernel-carrying extension is kept only when its computed ABI equals hostABIID.
+func FilterByKernelABIID(containers []Container, release, hostABIID string) []Container {
+	var filtered []Container
+	for i := range containers {
+		c := &containers[i]
+		id, err := c.ResolveExtensionABIID(release)
+		if err != nil {
+			log.Printf("Error: dropping container %s: %v", c.Name, err)
+			continue
+		}
+		if id == "" {
+			filtered = append(filtered, *c)
+			continue
+		}
+		if id != hostABIID {
+			log.Printf("Skipping container %s: kernel ABI ID %q != host %q", c.Name, id, hostABIID)
+			continue
+		}
+		filtered = append(filtered, *c)
+	}
+	return filtered
+}
+
+// SelectMountable filters the already-mounted extensions down to those
+// compatible with the running kernel, unmounting every extension it drops.
+// Survivors stay mounted for use as overlay lowerdirs.
+func SelectMountable(containers []Container, release, hostABIID string) []Container {
+	selected := FilterByKernelVersion(containers, kernelVersionFromRelease(release))
+	selected = FilterByKernelABIID(selected, release, hostABIID)
+
+	keep := make(map[string]bool, len(selected))
+	for _, c := range selected {
+		keep[c.MountPath] = true
+	}
+	for i := range containers {
+		if keep[containers[i].MountPath] {
+			continue
+		}
+		if err := containers[i].unmount(); err != nil {
+			log.Printf("Warning: failed to unmount dropped extension %s: %v", containers[i].Name, err)
+		}
+	}
+	return selected
+}
 
 // Extension represents an OS-block overlay extension. Extensions passed in
 // the leftExtensions slice of BuildOverlayOptions mount left of the hostapp
