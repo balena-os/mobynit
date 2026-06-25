@@ -143,28 +143,12 @@ func mountDataOverlays(newRootPath string) error {
 		return nil
 	}
 
-	containers, err := hostapp.Mount(filepath.Join(newRootPath, string(os.PathSeparator), filepath.Join(DATA_DIR_NAME, string(os.PathSeparator), DATA_LAYER_ROOT)), HOSTOS_BLOCKS_CLASS)
+	dockerRoot := filepath.Join(dataMountPath, DATA_LAYER_ROOT)
+	containers, err := hostapp.MountCompatibleExtensions(dockerRoot, HOSTOS_BLOCKS_CLASS)
 	if err != nil {
 		return err
 	}
 
-	if len(containers) == 0 {
-		return nil
-	}
-
-	// An empty release (e.g. uname failed) disables the version filter
-	release, err := hostapp.GetKernelRelease()
-	if err != nil {
-		log.Printf("Warning: could not get kernel release: %v", err)
-	}
-
-	cmdline, err := os.ReadFile("/proc/cmdline")
-	if err != nil {
-		log.Printf("Warning: could not read /proc/cmdline: %v", err)
-	}
-	hostABIID := hostapp.ParseHostKernelABIID(string(cmdline))
-
-	containers = hostapp.SelectMountable(containers, release, hostABIID)
 	if len(containers) == 0 {
 		log.Println("No extensions compatible with running kernel, skipping overlay")
 		return nil

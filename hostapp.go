@@ -154,8 +154,12 @@ func (container *Container) initialize(homePath string) error {
 	return nil
 }
 
-// initializeContainers finds and mounts containers
-func initializeContainers(rootdir string, match string) ([]Container, error) {
+// containerKeepFunc decides whether a freshly mounted extension should be kept.
+// false causes an immediate unmount.
+type containerKeepFunc func(*Container) bool
+
+// initializeContainers finds and mounts containers.
+func initializeContainers(rootdir string, match string, keep containerKeepFunc) ([]Container, error) {
 	containersDir := filepath.Join(rootdir, "containers")
 	entries, err := os.ReadDir(containersDir)
 	if err != nil {
@@ -197,9 +201,15 @@ func initializeContainers(rootdir string, match string) ([]Container, error) {
 
 		if _, err := container.mount(rootdir); err != nil {
 			log.Println("Failed to mount container:", err)
-		} else {
-			mountedContainers = append(mountedContainers, container)
+			continue
 		}
+		if keep != nil && !keep(&container) {
+			if err := container.unmount(); err != nil {
+				log.Printf("Warning: failed to unmount incompatible extension %s: %v", container.Name, err)
+			}
+			continue
+		}
+		mountedContainers = append(mountedContainers, container)
 	}
 
 	return mountedContainers, nil
@@ -210,7 +220,7 @@ func Mount(rootdir string, label string) ([]Container, error) {
 	if Debug {
 		log.Printf("Searching for container with ID/label %s in root directory %s\n", label, rootdir)
 	}
-	return initializeContainers(rootdir, label)
+	return initializeContainers(rootdir, label, nil)
 }
 
 const (
@@ -337,6 +347,52 @@ func (c *Container) ResolveExtensionABIID(release string) (string, error) {
 	return id, nil
 }
 
+// isExtensionKernelCompatible reports whether a mounted extension matches the
+// running kernel. Reads uname and cmdline, then checks the kernel-version label
+// and Module.symvers-derived ABI against balena_kernel_abi.
+func isExtensionKernelCompatible(c *Container) bool {
+	release, err := GetKernelRelease()
+	if err != nil {
+		log.Printf("Warning: could not get kernel release: %v", err)
+	}
+	cmdline, err := os.ReadFile("/proc/cmdline")
+	hostABIID := ""
+	if err != nil {
+		log.Printf("Warning: could not read /proc/cmdline: %v", err)
+	} else {
+		hostABIID = ParseHostKernelABIID(string(cmdline))
+	}
+
+	if kver := kernelVersionFromRelease(release); kver != "" {
+		if labelVal, ok := c.Labels[HOSTOS_BLOCKS_KERNEL_VERSION]; ok && labelVal != kver {
+			log.Printf("Skipping container %s: kernel version %q != running %q", c.Name, labelVal, kver)
+			return false
+		}
+	}
+
+	id, err := c.ResolveExtensionABIID(release)
+	if err != nil {
+		log.Printf("Error: dropping container %s: %v", c.Name, err)
+		return false
+	}
+	if id != "" && id != hostABIID {
+		log.Printf("Skipping container %s: kernel ABI ID %q != host %q", c.Name, id, hostABIID)
+		return false
+	}
+	return true
+}
+
+// MountCompatibleExtensions finds overlay extension containers, mounts each one,
+// and keeps only those compatible with the running kernel.
+func MountCompatibleExtensions(rootdir, match string) ([]Container, error) {
+	if Debug {
+		log.Printf("Searching for compatible container with ID/label %s in root directory %s\n", match, rootdir)
+	}
+	// If we were to add additionnal filters, we could make a combinatory function
+	// that combines our conditions.
+	return initializeContainers(rootdir, match, isExtensionKernelCompatible)
+}
+
 // FilterByKernelABIID keeps only those containers safe to mount over the
 // running kernel.
 //
@@ -362,28 +418,6 @@ func FilterByKernelABIID(containers []Container, release, hostABIID string) []Co
 		filtered = append(filtered, *c)
 	}
 	return filtered
-}
-
-// SelectMountable filters the already-mounted extensions down to those
-// compatible with the running kernel, unmounting every extension it drops.
-// Survivors stay mounted for use as overlay lowerdirs.
-func SelectMountable(containers []Container, release, hostABIID string) []Container {
-	selected := FilterByKernelVersion(containers, kernelVersionFromRelease(release))
-	selected = FilterByKernelABIID(selected, release, hostABIID)
-
-	keep := make(map[string]bool, len(selected))
-	for _, c := range selected {
-		keep[c.MountPath] = true
-	}
-	for i := range containers {
-		if keep[containers[i].MountPath] {
-			continue
-		}
-		if err := containers[i].unmount(); err != nil {
-			log.Printf("Warning: failed to unmount dropped extension %s: %v", containers[i].Name, err)
-		}
-	}
-	return selected
 }
 
 // Extension represents an OS-block overlay extension. Extensions passed in
