@@ -1,4 +1,29 @@
 - commits:
+    - subject: "hostapp: add kernel version ABI extension filtering"
+      hash: 230faf1f4e0cae0d6f20b0de8c99232844f6a714
+      body: >
+        Extensions can contain two labels (container labels or image labels,
+        with
+
+        container labels taking precedence):
+
+
+        * io.balena.image.kernel-version: user space ABI in the form M.m.p
+        revision
+
+        * io.balena.image.kernel-abi-id: kernel space ABI as a sha256 of the
+          Modules.symver file.
+      footer:
+        Change-type: patch
+        change-type: patch
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+  version: 1.0.1
+  title: ""
+  date: 2026-06-29T12:11:51.155Z
+- commits:
     - subject: "hostapp: implement override mount priority"
       hash: d3c16a06af5c69c7384260b7c8ca670abaf235ca
       body: |
