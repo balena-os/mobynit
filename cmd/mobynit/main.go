@@ -152,6 +152,24 @@ func mountDataOverlays(newRootPath string) error {
 		return nil
 	}
 
+	// An empty release (e.g. uname failed) disables the version filter
+	release, err := hostapp.GetKernelRelease()
+	if err != nil {
+		log.Printf("Warning: could not get kernel release: %v", err)
+	}
+
+	cmdline, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		log.Printf("Warning: could not read /proc/cmdline: %v", err)
+	}
+	hostABIID := hostapp.ParseHostKernelABIID(string(cmdline))
+
+	containers = hostapp.SelectMountable(containers, release, hostABIID)
+	if len(containers) == 0 {
+		log.Println("No extensions compatible with running kernel, skipping overlay")
+		return nil
+	}
+
 	var leftExtensions, rightExtensions []hostapp.Extension
 
 	for _, container := range containers {
