@@ -273,7 +273,7 @@ func FilterByKernelVersion(containers []Container, kernelVersion string) []Conta
 }
 
 // ComputeABIID returns the hex-encoded sha256 of the file at path.
-// Used to derive io.balena.image.kernel-abi-id from Module.symvers.
+// Used to derive io.balena.image.kernel-abi-id from the kernel image.
 func ComputeABIID(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -287,16 +287,20 @@ func ComputeABIID(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// ResolveExtensionABIID computes the container's kernel ABI ID as
-// sha256(<mount>/lib/modules/<release>/Module.symvers), where release is the
-// running kernel's uname release.
+// ResolveExtensionABIID returns the extension's kernel identity claim.
+// * The extension carries a modules tree
+// * A file directly under the extension's /boot (the shipped kernel image)
+//   hashes to hostABIID, the balena_kernel_abi cmdline token.
 //
-// Returns "" with no error if the extension carries no kernel modules for the
-// running release. Returns an error if /lib/modules/<release> exists
-// but Module.symvers is missing (broken extension), if the label disagrees with
-// the computed value, or if a module-carrying extension cannot be verified
-// because release is empty (running kernel unknown).
-func (c *Container) ResolveExtensionABIID(release string) (string, error) {
+// Returns "" (no claim) when:
+// * The extension is unmounted
+// * Carries no modules tree
+// * carries one for another release
+//
+// Returns errors when an extension claims the running release but cannot be
+// matched to the running kernel: unknown release, stock kernel (empty
+// hostABIID), no /boot, or no /boot file hashing to hostABIID.
+func (c *Container) ResolveExtensionABIID(release, hostABIID string) (string, error) {
 	if c.MountPath == "" {
 		return "", nil
 	}
@@ -319,44 +323,60 @@ func (c *Container) ResolveExtensionABIID(release string) (string, error) {
 		}
 		return "", fmt.Errorf("stat %s: %w", modDir, err)
 	}
-	symversPath := filepath.Join(modDir, "Module.symvers")
-	if _, err := os.Stat(symversPath); err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("broken extension %s: %s missing", c.Name, symversPath)
-		}
-		return "", fmt.Errorf("stat %s: %w", symversPath, err)
+
+	if hostABIID == "" {
+		return "", fmt.Errorf("extension %s: kernel-carrying but running kernel is stock", c.Name)
 	}
-	id, err := ComputeABIID(symversPath)
+
+	// The kernel-abi-id label is advisory: warn on absence or divergence for
+	// observability, but never gate the mount on it.
+	if labelVal := c.Labels[HOSTOS_BLOCKS_KERNEL_ABI_ID]; labelVal == "" {
+		log.Printf("Warning: extension %s: modules present but no %s label", c.Name, HOSTOS_BLOCKS_KERNEL_ABI_ID)
+	} else if labelVal != hostABIID {
+		log.Printf("Warning: extension %s: %s label %q != running kernel %q; using image match", c.Name, HOSTOS_BLOCKS_KERNEL_ABI_ID, labelVal, hostABIID)
+	}
+
+	bootDir := filepath.Join(c.MountPath, "boot")
+	entries, err := os.ReadDir(bootDir)
 	if err != nil {
-		return "", err
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("broken extension %s: modules present but no kernel image under /boot", c.Name)
+		}
+		return "", fmt.Errorf("broken extension %s: reading %s: %w", c.Name, bootDir, err)
 	}
-	if labelVal, ok := c.Labels[HOSTOS_BLOCKS_KERNEL_ABI_ID]; ok && labelVal != "" && labelVal != id {
-		return "", fmt.Errorf("extension %s: %s label %q != computed %q",
-			c.Name, HOSTOS_BLOCKS_KERNEL_ABI_ID, labelVal, id)
+	for _, e := range entries {
+		// Regular files only: following a symlink would let the bytes we
+		// verify live outside the extension being verified.
+		if !e.Type().IsRegular() {
+			continue
+		}
+		id, err := ComputeABIID(filepath.Join(bootDir, e.Name()))
+		if err != nil {
+			// One unreadable file must not mask a valid match elsewhere
+			// under /boot; a genuine no-match still fails below.
+			log.Printf("Warning: extension %s: skipping unreadable /boot file: %v", c.Name, err)
+			continue
+		}
+		if id == hostABIID {
+			return id, nil
+		}
 	}
-	return id, nil
+	return "", fmt.Errorf("extension %s: no /boot kernel image matches running kernel %q", c.Name, hostABIID)
 }
 
 // FilterByKernelABIID keeps only those containers safe to mount over the
 // running kernel.
 //
 // An ABI-agnostic extension makes no kernel-ABI claim and always passes.
-// A kernel-carrying extension is kept only when its computed ABI equals hostABIID.
+// A kernel-carrying extension is kept only when one of its /boot images
+// hashes to hostABIID; ResolveExtensionABIID errors otherwise, so no
+// further comparison is needed here.
 func FilterByKernelABIID(containers []Container, release, hostABIID string) []Container {
 	var filtered []Container
 	for i := range containers {
 		c := &containers[i]
-		id, err := c.ResolveExtensionABIID(release)
-		if err != nil {
+		if _, err := c.ResolveExtensionABIID(release, hostABIID); err != nil {
 			log.Printf("Error: dropping container %s: %v", c.Name, err)
-			continue
-		}
-		if id == "" {
-			filtered = append(filtered, *c)
-			continue
-		}
-		if id != hostABIID {
-			log.Printf("Skipping container %s: kernel ABI ID %q != host %q", c.Name, id, hostABIID)
 			continue
 		}
 		filtered = append(filtered, *c)

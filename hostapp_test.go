@@ -1,6 +1,7 @@
 package hostapp
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
@@ -956,175 +957,198 @@ func writeConfigV2(t *testing.T, name string, labels map[string]string, extra ma
 	return c
 }
 
-// writeModuleSymvers creates <mount>/lib/modules/<release>/Module.symvers with
-// the given content under a fresh temp dir, sets it as the container's
-// MountPath, and returns the sha256 the resolver must compute.
-func writeModuleSymvers(t *testing.T, c *Container, release string, content []byte) string {
+// buildAgnosticContainer builds an extension fixture that carries no
+// /lib/modules/<release> tree.
+func buildAgnosticContainer(t *testing.T, name string) Container {
 	t.Helper()
+	c := writeConfigV2(t, name, nil, nil)
+	c.MountPath = t.TempDir()
+	return c
+}
+
+// buildKernelImageContainer builds a kernel-claiming extension fixture for
+// the image-hash identity: modules tree for release, a kernel image under
+// /boot, and the kernel-abi-id label.
+func buildKernelImageContainer(t *testing.T, name, release string, imageContent []byte, label string) Container {
+	t.Helper()
+	var labels map[string]string
+	if label != "" {
+		labels = map[string]string{HOSTOS_BLOCKS_KERNEL_ABI_ID: label}
+	}
+	c := writeConfigV2(t, name, labels, nil)
+
 	mount := t.TempDir()
 	modDir := filepath.Join(mount, "lib", "modules", release)
 	if err := os.MkdirAll(modDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(modDir, "Module.symvers"), content, 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(modDir, "Module.symvers"), []byte("shared-symvers-same-config\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	c.MountPath = mount
+
+	if imageContent != nil {
+		bootDir := filepath.Join(mount, "boot")
+		if err := os.MkdirAll(bootDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bootDir, "Image.gz"), imageContent, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return c
+}
+
+// imageIDOf returns the hex sha256 of content, as ResolveExtensionABIID
+// computes it for a /boot file.
+func imageIDOf(content []byte) string {
 	sum := sha256.Sum256(content)
 	return hex.EncodeToString(sum[:])
 }
 
 func TestResolveExtensionABIID(t *testing.T) {
-	// A fixed release decouples the fixtures from the host's running kernel.
 	const release = "6.1.0-test"
+	img := []byte("kernel-image-build-X\n")
+	id := imageIDOf(img)
 
-	t.Run("empty MountPath returns empty (agnostic)", func(t *testing.T) {
-		c := writeConfigV2(t, "no-mount", nil, nil)
-		// MountPath deliberately left empty.
-		got, err := c.ResolveExtensionABIID(release)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if got != "" {
-			t.Errorf("expected empty, got %q", got)
+	t.Run("agnostic: no modules tree, no claim", func(t *testing.T) {
+		c := buildAgnosticContainer(t, "agnostic")
+		got, err := c.ResolveExtensionABIID(release, id)
+		if err != nil || got != "" {
+			t.Errorf("want \"\", nil; got %q, %v", got, err)
 		}
 	})
 
-	t.Run("no /lib/modules returns empty (agnostic)", func(t *testing.T) {
-		c := writeConfigV2(t, "no-modules", nil, nil)
-		c.MountPath = t.TempDir()
-		got, err := c.ResolveExtensionABIID(release)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if got != "" {
-			t.Errorf("expected empty, got %q", got)
+	t.Run("empty mount path: no claim", func(t *testing.T) {
+		c := Container{}
+		got, err := c.ResolveExtensionABIID(release, id)
+		if err != nil || got != "" {
+			t.Errorf("want \"\", nil; got %q, %v", got, err)
 		}
 	})
 
-	t.Run("empty release on an agnostic extension passes (no ABI claim)", func(t *testing.T) {
-		c := writeConfigV2(t, "agnostic-unknown-release", nil, nil)
-		c.MountPath = t.TempDir()
-		got, err := c.ResolveExtensionABIID("")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if got != "" {
-			t.Errorf("expected empty, got %q", got)
+	// The release=="" guard sits after the modules-tree stat, so an unknown
+	// running kernel is fatal only for extensions that actually claim one.
+	t.Run("empty release on an agnostic extension passes (no claim)", func(t *testing.T) {
+		c := buildAgnosticContainer(t, "agnostic-unknown-release")
+		got, err := c.ResolveExtensionABIID("", id)
+		if err != nil || got != "" {
+			t.Errorf("want \"\", nil; got %q, %v", got, err)
 		}
 	})
 
 	t.Run("empty release on a module-carrying extension is an error (fail-closed)", func(t *testing.T) {
-		c := writeConfigV2(t, "kernel-unknown-release", nil, nil)
-		writeModuleSymvers(t, &c, release, []byte("symvers-fixture\n"))
-		if _, err := c.ResolveExtensionABIID(""); err == nil {
+		c := buildKernelImageContainer(t, "kernel-unknown-release", release, img, id)
+		if _, err := c.ResolveExtensionABIID("", id); err == nil {
 			t.Error("expected error when running kernel release is unknown")
 		}
 	})
 
-	t.Run("modules dir without Module.symvers is an error (broken)", func(t *testing.T) {
-		c := writeConfigV2(t, "broken", nil, nil)
-		mount := t.TempDir()
-		if err := os.MkdirAll(filepath.Join(mount, "lib", "modules", release), 0755); err != nil {
+	t.Run("image matched against running kernel", func(t *testing.T) {
+		c := buildKernelImageContainer(t, "km", release, img, id)
+
+		cfgPath := filepath.Join(c.HomePath, "config.v2.json")
+		before, err := os.ReadFile(cfgPath)
+		if err != nil {
 			t.Fatal(err)
 		}
-		c.MountPath = mount
-		if _, err := c.ResolveExtensionABIID(release); err == nil {
-			t.Error("expected error for missing Module.symvers")
-		}
-	})
 
-	t.Run("Module.symvers present computes sha without writing it back", func(t *testing.T) {
-		c := writeConfigV2(t, "disco", nil, nil)
-		want := writeModuleSymvers(t, &c, release, []byte("ext-symvers-fixture\n"))
-
-		got, err := c.ResolveExtensionABIID(release)
+		got, err := c.ResolveExtensionABIID(release, id)
 		if err != nil {
-			t.Fatalf("ResolveExtensionABIID: %v", err)
-		}
-		if got != want {
-			t.Errorf("expected %q, got %q", want, got)
-		}
-		// The label is not persisted: the build bakes it onto the image, so
-		// mobynit must not mutate config.v2.json in the early-boot path.
-		if _, ok := c.Labels[HOSTOS_BLOCKS_KERNEL_ABI_ID]; ok {
-			t.Errorf("in-memory label should not be set, got %v", c.Labels)
-		}
-		raw, _ := os.ReadFile(filepath.Join(c.HomePath, "config.v2.json"))
-		var root map[string]interface{}
-		_ = json.Unmarshal(raw, &root)
-		labels, _ := root["Config"].(map[string]interface{})["Labels"].(map[string]interface{})
-		if _, ok := labels[HOSTOS_BLOCKS_KERNEL_ABI_ID]; ok {
-			t.Errorf("config.v2.json should not be written back, got labels %v", labels)
-		}
-	})
-
-	t.Run("label matching computed value passes", func(t *testing.T) {
-		c := writeConfigV2(t, "consistent", nil, nil)
-		want := writeModuleSymvers(t, &c, release, []byte("consistent-fixture\n"))
-		c.Labels[HOSTOS_BLOCKS_KERNEL_ABI_ID] = want
-
-		got, err := c.ResolveExtensionABIID(release)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if got != want {
-			t.Errorf("expected %q, got %q", want, got)
-		}
-	})
-
-	t.Run("label disagreeing with computed value is an error", func(t *testing.T) {
-		c := writeConfigV2(t, "inconsistent", nil, nil)
-		writeModuleSymvers(t, &c, release, []byte("inconsistent-fixture\n"))
-		c.Labels[HOSTOS_BLOCKS_KERNEL_ABI_ID] = "deadbeef-bogus-label"
-
-		if _, err := c.ResolveExtensionABIID(release); err == nil {
-			t.Error("expected error when label disagrees with computed sha256")
-		}
-	})
-}
-
-// abiKind selects how buildFilterContainer provisions an extension's mount.
-type abiKind int
-
-const (
-	abiAgnostic abiKind = iota // no /lib/modules/<release>: makes no ABI claim
-	abiBroken                  // /lib/modules/<release> present but Module.symvers missing
-	abiKernel                  // Module.symvers present, ABI = sha256(content)
-)
-
-// buildFilterContainer materialises a container exactly as FilterByKernelABIID
-// will see it: ABI-agnostic, broken, or kernel-carrying with a known symvers
-// content (so the caller can compute the matching host ABI).
-func buildFilterContainer(t *testing.T, name string, release string, kind abiKind, symvers []byte) Container {
-	t.Helper()
-	c := writeConfigV2(t, name, nil, nil)
-	switch kind {
-	case abiAgnostic:
-		c.MountPath = t.TempDir()
-	case abiBroken:
-		mount := t.TempDir()
-		if err := os.MkdirAll(filepath.Join(mount, "lib", "modules", release), 0755); err != nil {
 			t.Fatal(err)
 		}
-		c.MountPath = mount
-	case abiKernel:
-		writeModuleSymvers(t, &c, release, symvers)
-	}
-	return c
-}
+		if got != id {
+			t.Errorf("got %q, want %q", got, id)
+		}
 
-func abiOf(symvers []byte) string {
-	sum := sha256.Sum256(symvers)
-	return hex.EncodeToString(sum[:])
+		after, err := os.ReadFile(cfgPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Error("config.v2.json contents changed during early boot")
+		}
+	})
+
+	t.Run("image found among other /boot entries", func(t *testing.T) {
+		c := buildKernelImageContainer(t, "multi-boot", release, img, id)
+		bootDir := filepath.Join(c.MountPath, "boot")
+		// "Config-6.1.0" sorts before "Image.gz", so ReadDir yields the decoy
+		// first: a resolver that only hashed the first entry would fail here.
+		if err := os.WriteFile(filepath.Join(bootDir, "Config-6.1.0"), []byte("not-a-kernel\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(bootDir, "extlinux"), 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := c.ResolveExtensionABIID(release, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != id {
+			t.Errorf("got %q, want %q", got, id)
+		}
+	})
+
+	// The label is advisory: a stale or missing label must not drop an
+	// overlay whose shipped kernel IS the running kernel.
+	t.Run("stale label but image matches running kernel: mounts", func(t *testing.T) {
+		c := buildKernelImageContainer(t, "stale-label", release, img, imageIDOf([]byte("old-symvers-scheme\n")))
+		got, err := c.ResolveExtensionABIID(release, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != id {
+			t.Errorf("got %q, want %q", got, id)
+		}
+	})
+
+	t.Run("missing label but image matches running kernel: mounts", func(t *testing.T) {
+		c := buildKernelImageContainer(t, "no-label", release, img, "")
+		got, err := c.ResolveExtensionABIID(release, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != id {
+			t.Errorf("got %q, want %q", got, id)
+		}
+	})
+
+	t.Run("modules without /boot image: broken", func(t *testing.T) {
+		c := buildKernelImageContainer(t, "no-image", release, nil, id)
+		if _, err := c.ResolveExtensionABIID(release, id); err == nil {
+			t.Error("expected error for missing kernel image")
+		}
+	})
+
+	t.Run("image does not match running kernel: skipped", func(t *testing.T) {
+		c := buildKernelImageContainer(t, "mismatch", release, img, id)
+		if _, err := c.ResolveExtensionABIID(release, imageIDOf([]byte("other-build\n"))); err == nil {
+			t.Error("expected error when no /boot image hashes to hostABIID")
+		}
+	})
+
+	t.Run("empty hostABIID (stock boot): kernel-carrying skipped", func(t *testing.T) {
+		c := buildKernelImageContainer(t, "stock-boot", release, img, id)
+		if _, err := c.ResolveExtensionABIID(release, ""); err == nil {
+			t.Error("expected error for kernel-carrying extension on a stock-kernel boot")
+		}
+	})
 }
 
 func TestFilterByKernelABIID(t *testing.T) {
 	const release = "6.1.0-test"
 
-	abiA := []byte("abi-A-symvers\n")
-	abiB := []byte("abi-B-symvers\n")
-	hostA := abiOf(abiA)
+	imgA := []byte("kernel-image-build-A\n")
+	imgB := []byte("kernel-image-build-B\n")
+	hostA := imageIDOf(imgA)
+
+	kmA := buildKernelImageContainer(t, "match", release, imgA, imageIDOf(imgA))
+	kmB := buildKernelImageContainer(t, "wrong-build", release, imgB, imageIDOf(imgB))
+	unlabeled := buildKernelImageContainer(t, "unlabeled", release, imgA, "")
+	staleLabel := buildKernelImageContainer(t, "stale-label", release, imgA, imageIDOf([]byte("symvers-hash\n")))
+	agnostic := buildAgnosticContainer(t, "agnostic")
 
 	tests := []struct {
 		name        string
@@ -1132,57 +1156,13 @@ func TestFilterByKernelABIID(t *testing.T) {
 		hostABIID   string
 		expectNames []string
 	}{
-		{
-			name: "agnostic extension passes when host ABI present",
-			containers: []Container{
-				buildFilterContainer(t, "agnostic", release, abiAgnostic, nil),
-			},
-			hostABIID:   hostA,
-			expectNames: []string{"agnostic"},
-		},
-		{
-			name: "matching ABI mounts",
-			containers: []Container{
-				buildFilterContainer(t, "match", release, abiKernel, abiA),
-			},
-			hostABIID:   hostA,
-			expectNames: []string{"match"},
-		},
-		{
-			name: "mismatched ABI skipped",
-			containers: []Container{
-				buildFilterContainer(t, "wrong-abi", release, abiKernel, abiB),
-			},
-			hostABIID:   hostA,
-			expectNames: nil,
-		},
-		{
-			name: "broken extension skipped (fail-closed)",
-			containers: []Container{
-				buildFilterContainer(t, "broken", release, abiBroken, nil),
-			},
-			hostABIID:   hostA,
-			expectNames: nil,
-		},
-		{
-			name: "absent host ABI skips kernel block but passes agnostic (fail-closed)",
-			containers: []Container{
-				buildFilterContainer(t, "kernel", release, abiKernel, abiA),
-				buildFilterContainer(t, "agnostic", release, abiAgnostic, nil),
-			},
-			hostABIID:   "",
-			expectNames: []string{"agnostic"},
-		},
-		{
-			name: "mixed: only the ABI-matching kernel block and agnostic pass",
-			containers: []Container{
-				buildFilterContainer(t, "match", release, abiKernel, abiA),
-				buildFilterContainer(t, "wrong-abi", release, abiKernel, abiB),
-				buildFilterContainer(t, "agnostic", release, abiAgnostic, nil),
-			},
-			hostABIID:   hostA,
-			expectNames: []string{"match", "agnostic"},
-		},
+		{"agnostic passes", []Container{agnostic}, hostA, []string{"agnostic"}},
+		{"matching build mounts", []Container{kmA}, hostA, []string{"match"}},
+		{"other build skipped (same config, different image)", []Container{kmB}, hostA, nil},
+		{"unlabeled but matching image mounts (label is advisory)", []Container{unlabeled}, hostA, []string{"unlabeled"}},
+		{"stale label but matching image mounts (label is advisory)", []Container{staleLabel}, hostA, []string{"stale-label"}},
+		{"absent host id skips kernel blocks, keeps agnostic", []Container{kmA, agnostic}, "", []string{"agnostic"}},
+		{"mixed: only the booted build and agnostic pass", []Container{kmA, kmB, agnostic}, hostA, []string{"match", "agnostic"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1192,7 +1172,7 @@ func TestFilterByKernelABIID(t *testing.T) {
 				gotNames = append(gotNames, c.Name)
 			}
 			if !reflect.DeepEqual(gotNames, tt.expectNames) {
-				t.Errorf("expected %v, got %v", tt.expectNames, gotNames)
+				t.Errorf("got %v, want %v", gotNames, tt.expectNames)
 			}
 		})
 	}
