@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -164,6 +165,111 @@ func TestGetMounts_ContainsStandardMounts(t *testing.T) {
 			if !found {
 				t.Errorf("expected standard mount %s not found", expected)
 			}
+		}
+	}
+}
+
+// TestLowerdirFarm verifies the farm hands out short symlinks that resolve to
+// their targets.
+func TestLowerdirFarm(t *testing.T) {
+	farm, err := newLowerdirFarm()
+	if err != nil {
+		t.Fatalf("newLowerdirFarm: %v", err)
+	}
+	defer os.RemoveAll(farm.dir)
+
+	target1 := t.TempDir()
+	target2 := t.TempDir()
+
+	link1, err := farm.link(target1)
+	if err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	link2, err := farm.link(target2)
+	if err != nil {
+		t.Fatalf("link: %v", err)
+	}
+
+	if link1 == link2 {
+		t.Errorf("farm handed out the same path twice: %q", link1)
+	}
+
+	// Each symlink must resolve to its target.
+	for _, tc := range []struct{ link, target string }{{link1, target1}, {link2, target2}} {
+		got, err := filepath.EvalSymlinks(tc.link)
+		if err != nil {
+			t.Fatalf("resolving %s: %v", tc.link, err)
+		}
+		want, err := filepath.EvalSymlinks(tc.target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("%s resolves to %q, want %q", tc.link, got, want)
+		}
+	}
+
+	// The name must be a compact counter, not a 64-hex id: that is the point.
+	if base := filepath.Base(link1); len(base) > 8 {
+		t.Errorf("farm symlink name %q is not compact", base)
+	}
+}
+
+// TestLowerdirFarmMountsUnderKernel proves the kernel follows the farm's
+// absolute symlinks when they appear in a root overlay lowerdir, so extensions
+// referenced compactly still stack. Runs only as (real or mapped) root.
+func TestLowerdirFarmMountsUnderKernel(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root (or unshare -rm) to perform overlay mount")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+		t.Fatalf("unshare: %v", err)
+	}
+	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
+		t.Fatalf("make mounts private: %v", err)
+	}
+
+	farm, err := newLowerdirFarm()
+	if err != nil {
+		t.Fatalf("newLowerdirFarm: %v", err)
+	}
+	defer os.RemoveAll(farm.dir)
+
+	base := t.TempDir()
+	ext := t.TempDir()
+	if err := os.WriteFile(filepath.Join(base, "base.txt"), []byte("from-base"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ext, "ext.txt"), []byte("from-ext"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	baseLink, err := farm.link(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extLink, err := farm.link(ext)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mnt := t.TempDir()
+	opts := "lowerdir=" + extLink + ":" + baseLink
+	if err := unix.Mount("overlay", mnt, "overlay", 0, opts); err != nil {
+		t.Fatalf("overlay mount rejected with farm symlink lowerdir %q: %v", opts, err)
+	}
+	defer unix.Unmount(mnt, unix.MNT_DETACH)
+
+	for name, want := range map[string]string{"base.txt": "from-base", "ext.txt": "from-ext"} {
+		got, err := os.ReadFile(filepath.Join(mnt, name))
+		if err != nil {
+			t.Errorf("reading %s: %v", name, err)
+			continue
+		}
+		if string(got) != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
 		}
 	}
 }

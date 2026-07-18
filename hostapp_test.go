@@ -314,6 +314,160 @@ func TestMountVerifiesOverlayWorks(t *testing.T) {
 	t.Logf("Overlay mount verified: %s at %s with %d entries", container.Name, container.MountPath, len(entries))
 }
 
+// fakeOverlay2Layer creates an overlay2 layer directory <overlay2Dir>/<id>
+// with a diff/ subdir, a link file naming its short id, and the matching
+// l/<short> -> ../<id>/diff symlink the engine maintains. It returns the
+// short id so callers can wire up lower chains.
+func fakeOverlay2Layer(t *testing.T, overlay2Dir, id, short string) string {
+	t.Helper()
+	layerDir := filepath.Join(overlay2Dir, id)
+	if err := os.MkdirAll(filepath.Join(layerDir, "diff"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(layerDir, "link"), []byte(short), 0644); err != nil {
+		t.Fatal(err)
+	}
+	lDir := filepath.Join(overlay2Dir, "l")
+	if err := os.MkdirAll(lDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", id, "diff"), filepath.Join(lDir, short)); err != nil {
+		t.Fatal(err)
+	}
+	return short
+}
+
+// TestBuildLowerDirs verifies the lowerdir list references every layer by the
+// engine's compact overlay2/l/<short> symlink rather than the resolved
+// overlay2/<64-hex>/diff path.
+func TestBuildLowerDirs(t *testing.T) {
+	overlay2Dir := t.TempDir()
+
+	topID := strings.Repeat("a", 64)
+	parentID := strings.Repeat("b", 64)
+	initID := strings.Repeat("c", 64)
+
+	fakeOverlay2Layer(t, overlay2Dir, topID, "TOPSHORTLINKAAAAAAAAAAAAAA")
+	fakeOverlay2Layer(t, overlay2Dir, parentID, "PARENTSHORTLINKBBBBBBBBBBB")
+	// The init layer's directory carries the -init suffix; its short link
+	// target is what classifies it, without resolving the full path.
+	fakeOverlay2Layer(t, overlay2Dir, initID+"-init", "INITSHORTLINKCCCCCCCCCCCCC")
+
+	topLayerDir := filepath.Join(overlay2Dir, topID)
+	// lower lists the immediate parent (the init layer) first, then image layers.
+	lower := "l/INITSHORTLINKCCCCCCCCCCCCC:l/PARENTSHORTLINKBBBBBBBBBBB"
+	if err := os.WriteFile(filepath.Join(topLayerDir, "lower"), []byte(lower), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := buildLowerDirs(overlay2Dir, topLayerDir)
+	if err != nil {
+		t.Fatalf("buildLowerDirs: %v", err)
+	}
+
+	want := []string{
+		filepath.Join(overlay2Dir, "l", "TOPSHORTLINKAAAAAAAAAAAAAA"),
+		filepath.Join(overlay2Dir, "l", "PARENTSHORTLINKBBBBBBBBBBB"),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("buildLowerDirs = %v, want %v", got, want)
+	}
+
+	// The compact form must not carry any resolved /diff path: that is the
+	// whole point of the page-budget fix.
+	for _, d := range got {
+		if strings.HasSuffix(d, "/diff") {
+			t.Errorf("lowerdir %q is a resolved diff path, expected compact l/<short> form", d)
+		}
+	}
+}
+
+// TestBuildLowerDirsSingleLayer covers an image with no lower file (one layer):
+// only the top layer's compact reference is returned.
+func TestBuildLowerDirsSingleLayer(t *testing.T) {
+	overlay2Dir := t.TempDir()
+	topID := strings.Repeat("a", 64)
+	fakeOverlay2Layer(t, overlay2Dir, topID, "TOPSHORTLINKAAAAAAAAAAAAAA")
+
+	got, err := buildLowerDirs(overlay2Dir, filepath.Join(overlay2Dir, topID))
+	if err != nil {
+		t.Fatalf("buildLowerDirs: %v", err)
+	}
+	want := []string{filepath.Join(overlay2Dir, "l", "TOPSHORTLINKAAAAAAAAAAAAAA")}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("buildLowerDirs = %v, want %v", got, want)
+	}
+}
+
+// TestBuildLowerDirsMountsUnderKernel proves the kernel accepts the compact
+// l/<short> symlink lowerdir that buildLowerDirs produces.
+func TestBuildLowerDirsMountsUnderKernel(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root (or unshare -rm) to perform overlay mount")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+		t.Fatalf("unshare: %v", err)
+	}
+	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
+		t.Fatalf("make mounts private: %v", err)
+	}
+
+	overlay2Dir := t.TempDir()
+	topID := strings.Repeat("a", 64)
+	parentID := strings.Repeat("b", 64)
+	initID := strings.Repeat("c", 64)
+
+	fakeOverlay2Layer(t, overlay2Dir, topID, "TOPSHORTLINKAAAAAAAAAAAAAA")
+	fakeOverlay2Layer(t, overlay2Dir, parentID, "PARENTSHORTLINKBBBBBBBBBBB")
+	fakeOverlay2Layer(t, overlay2Dir, initID+"-init", "INITSHORTLINKCCCCCCCCCCCCC")
+
+	// Distinct content per layer so the merged view proves each was stacked.
+	write := func(id, name, content string) {
+		if err := os.WriteFile(filepath.Join(overlay2Dir, id, "diff", name), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(topID, "top.txt", "from-top")
+	write(parentID, "parent.txt", "from-parent")
+	// The init layer ships a file that must NOT appear: it is dropped.
+	write(initID+"-init", ".dockerenv", "")
+
+	topLayerDir := filepath.Join(overlay2Dir, topID)
+	lower := "l/INITSHORTLINKCCCCCCCCCCCCC:l/PARENTSHORTLINKBBBBBBBBBBB"
+	if err := os.WriteFile(filepath.Join(topLayerDir, "lower"), []byte(lower), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	lowerDirs, err := buildLowerDirs(overlay2Dir, topLayerDir)
+	if err != nil {
+		t.Fatalf("buildLowerDirs: %v", err)
+	}
+
+	mnt := t.TempDir()
+	opts := "lowerdir=" + strings.Join(lowerDirs, ":")
+	if err := unix.Mount("overlay", mnt, "overlay", 0, opts); err != nil {
+		t.Fatalf("overlay mount rejected by kernel with compact symlink lowerdir %q: %v", opts, err)
+	}
+	defer unix.Unmount(mnt, unix.MNT_DETACH)
+
+	for name, want := range map[string]string{"top.txt": "from-top", "parent.txt": "from-parent"} {
+		got, err := os.ReadFile(filepath.Join(mnt, name))
+		if err != nil {
+			t.Errorf("reading %s from merged overlay: %v", name, err)
+			continue
+		}
+		if string(got) != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	// The init layer was dropped, so its .dockerenv must not surface.
+	if _, err := os.Lstat(filepath.Join(mnt, ".dockerenv")); !os.IsNotExist(err) {
+		t.Errorf(".dockerenv leaked from init layer into merged overlay (err=%v)", err)
+	}
+}
+
 // TestBuildOverlayOptions tests the mount options string construction.
 func TestBuildOverlayOptions(t *testing.T) {
 	tests := []struct {

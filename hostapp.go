@@ -47,6 +47,51 @@ var (
 	Verbose bool = false
 )
 
+// shortLinkFor returns the overlay2/l/<short> symlink path for a layer
+// directory, reading the layer's own link file.
+func shortLinkFor(overlay2Dir, layerDir string) (string, error) {
+	linkBytes, err := os.ReadFile(filepath.Join(layerDir, "link"))
+	if err != nil {
+		return "", fmt.Errorf("reading link file for %s: %w", layerDir, err)
+	}
+	return filepath.Join(overlay2Dir, "l", strings.TrimSpace(string(linkBytes))), nil
+}
+
+// buildLowerDirs returns the readonly overlay lowerdir list for a top layer:
+// the top layer first, then its parent chain, every entry referenced by the
+// engine's compact overlay2/l/<short> symlink. Init layers are dropped.
+func buildLowerDirs(overlay2Dir, layerDir string) ([]string, error) {
+	top, err := shortLinkFor(overlay2Dir, layerDir)
+	if err != nil {
+		return nil, err
+	}
+	lowerDirs := []string{top}
+
+	lowerBytes, err := os.ReadFile(filepath.Join(layerDir, "lower"))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("reading lower file: %w", err)
+	}
+	if len(lowerBytes) == 0 {
+		return lowerDirs, nil
+	}
+
+	for _, link := range strings.Split(strings.TrimSpace(string(lowerBytes)), ":") {
+		linkPath := filepath.Join(overlay2Dir, link)
+		target, err := os.Readlink(linkPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolving %s: %w", link, err)
+		}
+		if strings.Contains(target, "-init/") {
+			if Debug {
+				log.Printf("Skipping init layer: %s", target)
+			}
+			continue
+		}
+		lowerDirs = append(lowerDirs, linkPath)
+	}
+	return lowerDirs, nil
+}
+
 // mount mounts the container's overlay filesystem using direct overlay2 metadata reading
 func (container *Container) mount(layerRoot string) (string, error) {
 	if container.Driver != "overlay2" {
@@ -64,37 +109,9 @@ func (container *Container) mount(layerRoot string) (string, error) {
 	overlay2Dir := filepath.Join(layerRoot, "overlay2")
 	layerDir := filepath.Join(overlay2Dir, mountID)
 
-	// The layer's own diff directory - this is the top layer
-	diffDir := filepath.Join(layerDir, "diff")
-
-	// Read lower file to get parent layer chain
-	lowerPath := filepath.Join(layerDir, "lower")
-	lowerBytes, err := os.ReadFile(lowerPath)
-	if err != nil && !os.IsNotExist(err) {
-		return "", fmt.Errorf("reading lower file: %w", err)
-	}
-
-	// Build lowerdir list: diff first, then all parent layers (including init)
-	// For readonly overlay, diff is part of lowerdir (no upperdir)
-	lowerDirs := []string{diffDir}
-
-	if len(lowerBytes) > 0 {
-		links := strings.Split(strings.TrimSpace(string(lowerBytes)), ":")
-		for _, link := range links {
-			resolved, err := filepath.EvalSymlinks(filepath.Join(overlay2Dir, link))
-			if err != nil {
-				return "", fmt.Errorf("resolving %s: %w", link, err)
-			}
-			// Skip init layers - they contain .dockerenv which causes
-			// systemd to detect container mode
-			if strings.Contains(resolved, "-init/") {
-				if Debug {
-					log.Printf("Skipping init layer: %s", resolved)
-				}
-				continue
-			}
-			lowerDirs = append(lowerDirs, resolved)
-		}
+	lowerDirs, err := buildLowerDirs(overlay2Dir, layerDir)
+	if err != nil {
+		return "", err
 	}
 
 	// Mount point: overlay2/<mount-id>/merged

@@ -97,6 +97,31 @@ const (
 /* Do not overlay images */
 var disable_overlays bool
 
+// lowerdirFarm hands out short numbered symlinks pointing at extension merged
+// mountpoints.
+type lowerdirFarm struct {
+	dir string
+	n   int
+}
+
+func newLowerdirFarm() (*lowerdirFarm, error) {
+	dir, err := os.MkdirTemp("", "mobynit-lower")
+	if err != nil {
+		return nil, fmt.Errorf("creating lowerdir farm: %w", err)
+	}
+	return &lowerdirFarm{dir: dir}, nil
+}
+
+// link creates a short absolute symlink to target and returns its path.
+func (f *lowerdirFarm) link(target string) (string, error) {
+	name := filepath.Join(f.dir, strconv.Itoa(f.n))
+	if err := os.Symlink(target, name); err != nil {
+		return "", fmt.Errorf("linking %s: %w", target, err)
+	}
+	f.n++
+	return name, nil
+}
+
 /* Filesystem type for data partition */
 var dataFstype string
 
@@ -170,6 +195,22 @@ func mountDataOverlays(newRootPath string) error {
 		return nil
 	}
 
+	farm, err := newLowerdirFarm()
+	if err != nil {
+		log.Printf("Warning: %v; using full extension paths", err)
+	}
+	shorten := func(name, mountPath string) string {
+		if farm == nil {
+			return mountPath
+		}
+		short, err := farm.link(mountPath)
+		if err != nil {
+			log.Printf("Warning: compacting %s lowerdir failed: %v; using full path", name, err)
+			return mountPath
+		}
+		return short
+	}
+
 	var leftExtensions, rightExtensions []hostapp.Extension
 
 	for _, container := range containers {
@@ -184,13 +225,13 @@ func mountDataOverlays(newRootPath string) error {
 			}
 			leftExtensions = append(leftExtensions, hostapp.Extension{
 				Name:      container.Config.Name,
-				MountPath: container.MountPath,
+				MountPath: shorten(container.Config.Name, container.MountPath),
 				Priority:  priority,
 			})
 		} else {
 			rightExtensions = append(rightExtensions, hostapp.Extension{
 				Name:      container.Config.Name,
-				MountPath: container.MountPath,
+				MountPath: shorten(container.Config.Name, container.MountPath),
 			})
 		}
 	}
