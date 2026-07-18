@@ -100,8 +100,9 @@ var disable_overlays bool
 // lowerdirFarm hands out short numbered symlinks pointing at extension merged
 // mountpoints.
 type lowerdirFarm struct {
-	dir string
-	n   int
+	dir   string
+	n     int
+	links map[string]string
 }
 
 func newLowerdirFarm() (*lowerdirFarm, error) {
@@ -109,17 +110,41 @@ func newLowerdirFarm() (*lowerdirFarm, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating lowerdir farm: %w", err)
 	}
-	return &lowerdirFarm{dir: dir}, nil
+	return &lowerdirFarm{dir: dir, links: make(map[string]string)}, nil
 }
 
 // link creates a short absolute symlink to target and returns its path.
 func (f *lowerdirFarm) link(target string) (string, error) {
+	if name, ok := f.links[target]; ok {
+		return name, nil
+	}
 	name := filepath.Join(f.dir, strconv.Itoa(f.n))
 	if err := os.Symlink(target, name); err != nil {
 		return "", fmt.Errorf("linking %s: %w", target, err)
 	}
 	f.n++
+	f.links[target] = name
 	return name, nil
+}
+
+// shortenChain replaces each layer reference with a compact farm symlink.
+// A nil farm or a failed link degrades to the original path.
+func shortenChain(farm *lowerdirFarm, name string, layers []string) []string {
+	out := make([]string, 0, len(layers))
+	for _, l := range layers {
+		if farm == nil {
+			out = append(out, l)
+			continue
+		}
+		short, err := farm.link(l)
+		if err != nil {
+			log.Printf("Warning: compacting %s lowerdir failed: %v; using full path", name, err)
+			out = append(out, l)
+			continue
+		}
+		out = append(out, short)
+	}
+	return out
 }
 
 /* Filesystem type for data partition */
@@ -147,7 +172,7 @@ func mountSysroot(rootdir string) ([]hostapp.Container, error) {
 	return containers, err
 }
 
-func mountDataOverlays(newRootPath string) error {
+func mountDataOverlays(newRootPath string, baseLayers []string) error {
 	device, err := os.Readlink(filepath.Join("/dev/disk/by-state/", DATA_STATE_NAME))
 	if err != nil {
 		return fmt.Errorf("No udev by-state resin-data symbolic link")
@@ -199,17 +224,8 @@ func mountDataOverlays(newRootPath string) error {
 	if err != nil {
 		log.Printf("Warning: %v; using full extension paths", err)
 	}
-	shorten := func(name, mountPath string) string {
-		if farm == nil {
-			return mountPath
-		}
-		short, err := farm.link(mountPath)
-		if err != nil {
-			log.Printf("Warning: compacting %s lowerdir failed: %v; using full path", name, err)
-			return mountPath
-		}
-		return short
-	}
+
+	baseLayers = shortenChain(farm, "hostapp", baseLayers)
 
 	var leftExtensions, rightExtensions []hostapp.Extension
 
@@ -217,26 +233,30 @@ func mountDataOverlays(newRootPath string) error {
 		if container.Config.Driver != "overlay2" {
 			return fmt.Errorf("Only overlay2 images supported, not %v", container.Config.Driver)
 		}
+		ext := hostapp.Extension{
+			Name:   container.Config.Name,
+			Layers: shortenChain(farm, container.Config.Name, container.Layers),
+		}
 		if overrideVal, ok := container.Labels[hostapp.HOSTOS_BLOCKS_OVERRIDE]; ok {
 			priority, err := strconv.Atoi(overrideVal)
 			if err != nil {
 				priority = math.MaxInt
 				log.Printf("Warning: container %s has invalid override priority %q, defaulting to lowest", container.Config.Name, overrideVal)
 			}
-			leftExtensions = append(leftExtensions, hostapp.Extension{
-				Name:      container.Config.Name,
-				MountPath: shorten(container.Config.Name, container.MountPath),
-				Priority:  priority,
-			})
+			ext.Priority = priority
+			leftExtensions = append(leftExtensions, ext)
 		} else {
-			rightExtensions = append(rightExtensions, hostapp.Extension{
-				Name:      container.Config.Name,
-				MountPath: shorten(container.Config.Name, container.MountPath),
-			})
+			rightExtensions = append(rightExtensions, ext)
 		}
 	}
 
-	mountOptions := hostapp.BuildOverlayOptions(newRootPath, leftExtensions, rightExtensions)
+	for i := range containers {
+		if err := containers[i].Unmount(); err != nil {
+			log.Printf("Warning: releasing extension mount %s: %v", containers[i].Config.Name, err)
+		}
+	}
+
+	mountOptions := hostapp.BuildOverlayOptions(baseLayers, leftExtensions, rightExtensions)
 
 	if err := unix.Mount("overlay", newRootPath, "overlay", 0, mountOptions); err != nil {
 		return fmt.Errorf("Error mounting image: %v", err)
@@ -282,7 +302,7 @@ func prepareForPivot() (string, error) {
 	}
 
 	if !disable_overlays {
-		if err := mountDataOverlays(newRootPath); err != nil {
+		if err := mountDataOverlays(newRootPath, containers[0].Layers); err != nil {
 			log.Print(err)
 		}
 	}

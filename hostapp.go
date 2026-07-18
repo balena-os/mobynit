@@ -38,6 +38,7 @@ type Container struct {
 	Config
 	MountPath string
 	HomePath  string
+	Layers []string
 }
 
 var (
@@ -131,14 +132,15 @@ func (container *Container) mount(layerRoot string) (string, error) {
 	}
 
 	container.MountPath = mountPoint
+	container.Layers = lowerDirs
 	log.Printf("Mounted ID %s in %s\n", container.ID, container.MountPath)
 
 	return container.MountPath, nil
 }
 
-// unmount releases the container's overlay filesystem. It is a no-op for a
-// container that was never mounted (MountPath == "").
-func (container *Container) unmount() error {
+// Unmount releases the container's overlay filesystem. It is a no-op for a
+// container that was never mounted.
+func (container *Container) Unmount() error {
 	if container.MountPath == "" {
 		return nil
 	}
@@ -416,34 +418,56 @@ func SelectMountable(containers []Container, release, hostABIID string) []Contai
 		if keep[containers[i].MountPath] {
 			continue
 		}
-		if err := containers[i].unmount(); err != nil {
+		if err := containers[i].Unmount(); err != nil {
 			log.Printf("Warning: failed to unmount dropped extension %s: %v", containers[i].Name, err)
 		}
 	}
 	return selected
 }
 
-// Extension represents an OS-block overlay extension. Extensions passed in
-// the leftExtensions slice of BuildOverlayOptions mount left of the hostapp
-// in lowerdir at their Priority (lower = higher overlayfs precedence, ties
-// broken by Name). Extensions passed in rightExtensions mount right of the
-// hostapp; their Priority field is ignored.
-type Extension struct {
-	Name      string
-	MountPath string
-	Priority  int
+// dedupLayers drops repeated layer references, keeping the LAST occurrence
+// of each. Overlayfs rejects a lowerdir naming the same directory twice
+// (ELOOP).
+func dedupLayers(layers []string) []string {
+	seen := make(map[string]struct{}, len(layers))
+	out := make([]string, 0, len(layers))
+	for i := len(layers) - 1; i >= 0; i-- {
+		if _, dup := seen[layers[i]]; dup {
+			if Debug {
+				log.Printf("Dropping duplicate shared layer %s", layers[i])
+			}
+			continue
+		}
+		seen[layers[i]] = struct{}{}
+		out = append(out, layers[i])
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
 }
 
-// BuildOverlayOptions constructs an overlay lowerdir mount options string.
-// leftExtensions mount left of basePath (taking overlayfs precedence over it)
-// sorted by Priority ascending with Name as tie-breaker. rightExtensions mount
-// right of basePath in the order given. basePath is always included.
+// Extension represents an OS-block overlay extension as a layer chain.
+// Extensions passed in the leftExtensions slice of BuildOverlayOptions layer
+// left of the base chain in lowerdir at their Priority (lower = higher
+// overlayfs precedence, ties broken by Name). Extensions passed in
+// rightExtensions layer right of the base chain; their Priority field is
+// ignored.
+type Extension struct {
+	Name     string
+	Layers   []string
+	Priority int
+}
+
+// BuildOverlayOptions constructs a flat overlay lowerdir mount options string
+// from per-image layer chains.
 //
-// Extensions that would push the options string past the kernel page-size
-// limit are dropped: rightExtensions first, then the lowest-priority
-// leftExtensions. Drops are logged per name. The set of extensions that fit
-// is logged in mount order.
-func BuildOverlayOptions(basePath string, leftExtensions, rightExtensions []Extension) string {
+// Extensions whose chain would push the options string past the kernel
+// page-size limit are dropped as WHOLE chains (a partial chain would compose
+// a partial image): rightExtensions first, then the lowest-priority
+// leftExtensions. Drops are logged per name. The set that fits is logged in
+// mount order.
+func BuildOverlayOptions(baseLayers []string, leftExtensions, rightExtensions []Extension) string {
 	sort.Slice(leftExtensions, func(i, j int) bool {
 		if leftExtensions[i].Priority != leftExtensions[j].Priority {
 			return leftExtensions[i].Priority < leftExtensions[j].Priority
@@ -452,28 +476,29 @@ func BuildOverlayOptions(basePath string, leftExtensions, rightExtensions []Exte
 	})
 
 	pageLimit := os.Getpagesize() - 1
+	base := strings.Join(baseLayers, ":")
 
-	// Phase 1: prepend leftExtensions (highest priority first) while basePath still fits
 	prefix := "lowerdir="
 	leftIncluded := 0
 	for _, e := range leftExtensions {
-		candidate := prefix + e.MountPath + ":" + basePath
+		chain := strings.Join(e.Layers, ":")
+		candidate := prefix + chain + ":" + base
 		if len(candidate) >= pageLimit {
 			break
 		}
-		prefix += e.MountPath + ":"
+		prefix += chain + ":"
 		leftIncluded++
 	}
 	for _, e := range leftExtensions[leftIncluded:] {
 		log.Printf("Warning: extension %q dropped due to page size limit", e.Name)
 	}
 
-	opts := prefix + basePath
+	opts := prefix + base
 
 	// Phase 2: append rightExtensions as space allows
 	rightIncluded := 0
 	for _, e := range rightExtensions {
-		candidate := opts + ":" + e.MountPath
+		candidate := opts + ":" + strings.Join(e.Layers, ":")
 		if len(candidate) >= pageLimit {
 			break
 		}
@@ -484,19 +509,22 @@ func BuildOverlayOptions(basePath string, leftExtensions, rightExtensions []Exte
 		log.Printf("Warning: extension %q dropped due to page size limit", e.Name)
 	}
 
+	// Dedup shared layers AFTER the page-budget drops
+	opts = "lowerdir=" + strings.Join(dedupLayers(strings.Split(strings.TrimPrefix(opts, "lowerdir="), ":")), ":")
+
 	// Log what fit, in mount order
 	log.Println("Overlayed images:")
 	idx := 0
 	for i := 0; i < leftIncluded; i++ {
 		e := leftExtensions[i]
-		log.Printf("\t[%d] %s (left, priority=%d)", idx, e.Name, e.Priority)
+		log.Printf("\t[%d] %s (left, priority=%d, %d layers)", idx, e.Name, e.Priority, len(e.Layers))
 		idx++
 	}
-	log.Printf("\t[%d] %s (hostapp)", idx, basePath)
+	log.Printf("\t[%d] hostapp (%d layers)", idx, len(baseLayers))
 	idx++
 	for i := 0; i < rightIncluded; i++ {
 		e := rightExtensions[i]
-		log.Printf("\t[%d] %s (right)", idx, e.Name)
+		log.Printf("\t[%d] %s (right, %d layers)", idx, e.Name, len(e.Layers))
 		idx++
 	}
 

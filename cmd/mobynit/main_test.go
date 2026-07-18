@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -215,6 +216,29 @@ func TestLowerdirFarm(t *testing.T) {
 	}
 }
 
+// TestLowerdirFarmIdempotent verifies linking the same target twice returns
+// the same symlink.
+func TestLowerdirFarmIdempotent(t *testing.T) {
+	farm, err := newLowerdirFarm()
+	if err != nil {
+		t.Fatalf("newLowerdirFarm: %v", err)
+	}
+	defer os.RemoveAll(farm.dir)
+
+	target := t.TempDir()
+	first, err := farm.link(target)
+	if err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	second, err := farm.link(target)
+	if err != nil {
+		t.Fatalf("relink: %v", err)
+	}
+	if first != second {
+		t.Errorf("farm not idempotent: %q then %q for the same target", first, second)
+	}
+}
+
 // TestLowerdirFarmMountsUnderKernel proves the kernel follows the farm's
 // absolute symlinks when they appear in a root overlay lowerdir, so extensions
 // referenced compactly still stack. Runs only as (real or mapped) root.
@@ -271,6 +295,38 @@ func TestLowerdirFarmMountsUnderKernel(t *testing.T) {
 		if string(got) != want {
 			t.Errorf("%s = %q, want %q", name, got, want)
 		}
+	}
+}
+
+// TestShortenChain verifies each layer reference in a chain is replaced by a
+// farm symlink resolving back to the original target, preserving order.
+func TestShortenChain(t *testing.T) {
+	farm, err := newLowerdirFarm()
+	if err != nil {
+		t.Fatalf("newLowerdirFarm: %v", err)
+	}
+	defer os.RemoveAll(farm.dir)
+
+	layers := []string{"/some/long/layer/path/one", "/some/long/layer/path/two"}
+	short := shortenChain(farm, "ext", layers)
+
+	if len(short) != len(layers) {
+		t.Fatalf("expected %d entries, got %d", len(layers), len(short))
+	}
+	for i, s := range short {
+		target, err := os.Readlink(s)
+		if err != nil {
+			t.Fatalf("entry %d (%s) is not a symlink: %v", i, s, err)
+		}
+		if target != layers[i] {
+			t.Errorf("entry %d resolves to %q, want %q", i, target, layers[i])
+		}
+	}
+
+	// A nil farm passes the chain through untouched (degraded mode).
+	passthrough := shortenChain(nil, "ext", layers)
+	if !reflect.DeepEqual(passthrough, layers) {
+		t.Errorf("nil farm must pass through, got %v", passthrough)
 	}
 }
 

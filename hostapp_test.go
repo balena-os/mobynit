@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -468,64 +469,64 @@ func TestBuildLowerDirsMountsUnderKernel(t *testing.T) {
 	}
 }
 
-// TestBuildOverlayOptions tests the mount options string construction.
+// TestBuildOverlayOptions tests the flat mount options string construction.
 func TestBuildOverlayOptions(t *testing.T) {
 	tests := []struct {
 		name            string
-		basePath        string
+		baseLayers      []string
 		leftExtensions  []Extension
 		rightExtensions []Extension
 		expected        string
 	}{
 		{
-			name:     "base only",
-			basePath: "/base",
-			expected: "lowerdir=/base",
+			name:       "base only",
+			baseLayers: []string{"/b1", "/b2"},
+			expected:   "lowerdir=/b1:/b2",
 		},
 		{
-			name:     "rights only",
-			basePath: "/base",
+			name:       "rights only",
+			baseLayers: []string{"/base"},
 			rightExtensions: []Extension{
-				{MountPath: "/n1", Name: "right1"},
-				{MountPath: "/n2", Name: "right2"},
+				{Layers: []string{"/n1a", "/n1b"}, Name: "right1"},
+				{Layers: []string{"/n2"}, Name: "right2"},
 			},
-			expected: "lowerdir=/base:/n1:/n2",
+			expected: "lowerdir=/base:/n1a:/n1b:/n2",
 		},
 		{
-			name:     "single left",
-			basePath: "/base",
+			name:       "single left multi-layer",
+			baseLayers: []string{"/base"},
 			leftExtensions: []Extension{
-				{MountPath: "/o1", Name: "left1", Priority: 10},
+				{Layers: []string{"/o1a", "/o1b"}, Name: "left1", Priority: 10},
 			},
-			expected: "lowerdir=/o1:/base",
+			expected: "lowerdir=/o1a:/o1b:/base",
 		},
 		{
-			name:     "left sorting",
-			basePath: "/base",
+			name:       "left sorting",
+			baseLayers: []string{"/base"},
 			leftExtensions: []Extension{
-				{MountPath: "/o2", Name: "left2", Priority: 50},
-				{MountPath: "/o1", Name: "left1", Priority: 10},
+				{Layers: []string{"/o2"}, Name: "left2", Priority: 50},
+				{Layers: []string{"/o1"}, Name: "left1", Priority: 10},
 			},
 			expected: "lowerdir=/o1:/o2:/base",
 		},
 		{
-			name:     "equal priority tie-break by name",
-			basePath: "/base",
+			name:       "equal priority tie-break by name",
+			baseLayers: []string{"/base"},
 			leftExtensions: []Extension{
-				{MountPath: "/zz", Name: "zulu", Priority: 10},
-				{MountPath: "/aa", Name: "alpha", Priority: 10},
+				{Layers: []string{"/zz"}, Name: "zulu", Priority: 10},
+				{Layers: []string{"/aa"}, Name: "alpha", Priority: 10},
 			},
 			expected: "lowerdir=/aa:/zz:/base",
 		},
 		{
-			name:     "both sides",
-			basePath: "/base",
+			name:       "both sides",
+			baseLayers: []string{"/base"},
 			leftExtensions: []Extension{
-				{MountPath: "/o1", Name: "left1", Priority: 10},
+				{Layers: []string{"/o1"}, Name: "left1", Priority: 10},
 			},
 			rightExtensions: []Extension{
-				{MountPath: "/n1", Name: "right1"},
-				{MountPath: "/n2", Name: "right2"},
+				{Layers: []string{"/n1"}, Name: "right1"},
+				{Layers: []string{"/n2"}, Name: "right2"},
 			},
 			expected: "lowerdir=/o1:/base:/n1:/n2",
 		},
@@ -533,7 +534,7 @@ func TestBuildOverlayOptions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := BuildOverlayOptions(tt.basePath, tt.leftExtensions, tt.rightExtensions)
+			result := BuildOverlayOptions(tt.baseLayers, tt.leftExtensions, tt.rightExtensions)
 			if result != tt.expected {
 				t.Errorf("expected %q, got %q", tt.expected, result)
 			}
@@ -541,102 +542,82 @@ func TestBuildOverlayOptions(t *testing.T) {
 	}
 }
 
-// TestBuildOverlayOptionsTruncation verifies page-size truncation behavior.
+// TestBuildOverlayOptionsTruncation verifies page-size behavior: extensions
+// are dropped as WHOLE chains (a partial chain would compose a partial
+// image), rights before lefts, and the base chain is always present.
 func TestBuildOverlayOptionsTruncation(t *testing.T) {
 	pageSize := os.Getpagesize()
 
-	// Create a long base path that leaves limited room
-	basePath := "/" + strings.Repeat("b", pageSize/3)
+	baseLayers := []string{"/" + strings.Repeat("b", pageSize/3)}
 
-	// Left extension should be included before base
 	left := Extension{
-		MountPath: "/" + strings.Repeat("o", pageSize/3),
-		Name:      "left",
-		Priority:  10,
+		Layers:   []string{"/" + strings.Repeat("o", pageSize/3)},
+		Name:     "left",
+		Priority: 10,
 	}
-
-	// Right extension that would exceed page size
 	rightLong := Extension{
-		MountPath: "/" + strings.Repeat("n", pageSize/3),
-		Name:      "right",
+		Layers: []string{"/" + strings.Repeat("n", pageSize/3)},
+		Name:   "right",
 	}
 
-	result := BuildOverlayOptions(basePath, []Extension{left}, []Extension{rightLong})
+	result := BuildOverlayOptions(baseLayers, []Extension{left}, []Extension{rightLong})
 
-	// Left extension and base must be present
-	if !strings.Contains(result, left.MountPath) {
-		t.Error("left extension path missing from result")
+	if !strings.Contains(result, left.Layers[0]) {
+		t.Error("left extension chain missing from result")
 	}
-	if !strings.Contains(result, basePath) {
-		t.Error("base path missing from result")
+	if !strings.Contains(result, baseLayers[0]) {
+		t.Error("base chain missing from result")
 	}
-
-	// Right extension should be truncated (total would exceed page size)
-	if strings.Contains(result, rightLong.MountPath) {
-		t.Error("right extension path should have been truncated due to page size limit")
+	if strings.Contains(result, rightLong.Layers[0]) {
+		t.Error("right extension should have been dropped due to page size limit")
 	}
-
 	if len(result) >= pageSize-1 {
 		t.Errorf("result length %d exceeds page size limit %d", len(result), pageSize-1)
 	}
 
-	// Verify left extension is dropped (not basePath) when it + basePath exceed page size
+	// A left extension whose chain does not fit is dropped whole, base stays.
 	hugeLeft := Extension{
-		MountPath: "/" + strings.Repeat("x", pageSize),
-		Name:      "huge",
-		Priority:  1,
+		Layers:   []string{"/" + strings.Repeat("x", pageSize)},
+		Name:     "huge",
+		Priority: 1,
 	}
-	degraded := BuildOverlayOptions("/base", []Extension{hugeLeft}, nil)
-	if !strings.Contains(degraded, "/base") {
-		t.Error("basePath must always be present even when left extensions exceed page size")
-	}
-	if strings.Contains(degraded, hugeLeft.MountPath) {
-		t.Error("huge left extension should have been dropped")
+	degraded := BuildOverlayOptions([]string{"/base"}, []Extension{hugeLeft}, nil)
+	if degraded != "lowerdir=/base" {
+		t.Errorf("expected bare base chain, got %q", degraded)
 	}
 
-	// Partial left truncation: 3 left extensions where only first 2 fit with basePath.
-	// Each path is ~1/3 of available space so 3 paths fit but 4 don't.
-	third := (pageSize - len("lowerdir=") - 3) / 3 // 3 paths + 2 colons fit
-	lefts := []Extension{
-		{MountPath: "/" + strings.Repeat("a", third-1), Name: "first", Priority: 1},
-		{MountPath: "/" + strings.Repeat("b", third-1), Name: "second", Priority: 2},
-		{MountPath: "/" + strings.Repeat("c", third-1), Name: "third", Priority: 3},
+	// Whole-chain semantics: an extension with two layers where only the
+	// first would fit must contribute NEITHER layer.
+	half := pageSize / 2
+	twoLayer := Extension{
+		Layers:   []string{"/" + strings.Repeat("p", half/4), "/" + strings.Repeat("q", half)},
+		Name:     "two-layer",
+		Priority: 1,
 	}
-	shortBase := "/" + strings.Repeat("z", third-1)
-	partial := BuildOverlayOptions(shortBase, lefts, nil)
-	if !strings.Contains(partial, lefts[0].MountPath) {
-		t.Error("highest-priority left extension should be present")
-	}
-	if !strings.Contains(partial, lefts[1].MountPath) {
-		t.Error("second-priority left extension should be present")
-	}
-	if !strings.Contains(partial, shortBase) {
-		t.Error("basePath must always be present")
-	}
-	if strings.Contains(partial, lefts[2].MountPath) {
-		t.Error("third left extension should have been dropped due to page size")
+	partial := BuildOverlayOptions([]string{"/" + strings.Repeat("z", half)}, []Extension{twoLayer}, nil)
+	if strings.Contains(partial, twoLayer.Layers[0]) || strings.Contains(partial, twoLayer.Layers[1]) {
+		t.Errorf("partially-fitting chain must be dropped whole, got %q", partial)
 	}
 
-	// Right extensions dropped before left extensions: one left + basePath nearly
-	// fill the budget, right should be dropped while left stays
-	almostFull := Extension{
-		MountPath: "/" + strings.Repeat("o", pageSize/2),
-		Name:      "big-left",
-		Priority:  1,
+	// Rights are dropped before lefts.
+	bigLeft := Extension{
+		Layers:   []string{"/" + strings.Repeat("o", pageSize/2)},
+		Name:     "big-left",
+		Priority: 1,
 	}
-	mediumBase := "/" + strings.Repeat("b", pageSize/4)
+	mediumBase := []string{"/" + strings.Repeat("b", pageSize/4)}
 	rightExt := Extension{
-		MountPath: "/" + strings.Repeat("n", pageSize/4),
-		Name:      "right",
+		Layers: []string{"/" + strings.Repeat("n", pageSize/4)},
+		Name:   "right",
 	}
-	mixed := BuildOverlayOptions(mediumBase, []Extension{almostFull}, []Extension{rightExt})
-	if !strings.Contains(mixed, almostFull.MountPath) {
+	mixed := BuildOverlayOptions(mediumBase, []Extension{bigLeft}, []Extension{rightExt})
+	if !strings.Contains(mixed, bigLeft.Layers[0]) {
 		t.Error("left extension should be present")
 	}
-	if !strings.Contains(mixed, mediumBase) {
-		t.Error("basePath must always be present")
+	if !strings.Contains(mixed, mediumBase[0]) {
+		t.Error("base chain must always be present")
 	}
-	if strings.Contains(mixed, rightExt.MountPath) {
+	if strings.Contains(mixed, rightExt.Layers[0]) {
 		t.Error("right extension should have been dropped since left + base already near limit")
 	}
 }
@@ -696,11 +677,11 @@ func TestOverlayStacking(t *testing.T) {
 
 	rightExtensions := make([]Extension, len(osBlocks))
 	for i, c := range osBlocks {
-		rightExtensions[i] = Extension{Name: c.Name, MountPath: c.MountPath}
+		rightExtensions[i] = Extension{Name: c.Name, Layers: c.Layers}
 		t.Logf("OS block %d: %s at %s", i, c.Name, c.MountPath)
 	}
 
-	opts := BuildOverlayOptions(hostappPath, nil, rightExtensions)
+	opts := BuildOverlayOptions(hostappContainers[0].Layers, nil, rightExtensions)
 	t.Logf("Mount options: %s", opts)
 
 	if err := unix.Mount("overlay", stackedMount, "overlay", 0, opts); err != nil {
@@ -1389,12 +1370,12 @@ func TestSelectMountable(t *testing.T) {
 	// mismatches, so SelectMountable drops and unmounts it; keepid is unlabelled
 	// and survives. Neither carries kernel modules, so the ABI filter passes both.
 	all := []Container{
-		{Config: Config{ID: "keepid", Name: "keep"}, MountPath: keepPath},
+		{Config: Config{ID: "keepid", Name: "keep"}, MountPath: keepPath, Layers: []string{"/k1", "/k2"}},
 		{Config: Config{
 			ID:         "dropid",
 			Name:       "drop",
 			HostConfig: HostConfig{Labels: map[string]string{HOSTOS_BLOCKS_KERNEL_VERSION: "0.0.0"}},
-		}, MountPath: dropPath},
+		}, MountPath: dropPath, Layers: []string{"/d1"}},
 	}
 
 	selected := SelectMountable(all, "6.0.0", "")
@@ -1415,5 +1396,388 @@ func TestSelectMountable(t *testing.T) {
 	}
 	if all[1].MountPath != "" {
 		t.Errorf("dropped MountPath should be cleared, got %q", all[1].MountPath)
+	}
+	// Layers is chain metadata, not mount state: it must survive the unmount
+	// so the flat root compose can reference chains of released scaffolding.
+	if !reflect.DeepEqual(all[1].Layers, []string{"/d1"}) {
+		t.Errorf("dropped container lost its Layers: %v", all[1].Layers)
+	}
+}
+
+// fakeTwoLayerImage builds a two-layer fake overlay2 image (top + parent,
+// lower file wired) under overlay2Dir and returns its top layer dir. prefix
+// is a single distinguishing character. Overlayfs lower-only mounts need at
+// least two lowerdirs, which is also why real container mounts always have
+// the container top layer plus at least one image layer.
+func fakeTwoLayerImage(t *testing.T, overlay2Dir, prefix string, files map[string]string) string {
+	t.Helper()
+	topID := strings.Repeat(prefix, 64)[:64]
+	parentID := strings.Repeat(prefix+"0", 32)[:64]
+	topShort := (strings.ToUpper(prefix) + strings.Repeat("T", 26))[:26]
+	parentShort := (strings.ToUpper(prefix) + strings.Repeat("P", 26))[:26]
+	fakeOverlay2Layer(t, overlay2Dir, topID, topShort)
+	fakeOverlay2Layer(t, overlay2Dir, parentID, parentShort)
+	topLayerDir := filepath.Join(overlay2Dir, topID)
+	if err := os.WriteFile(filepath.Join(topLayerDir, "lower"), []byte("l/"+parentShort), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(topLayerDir, "diff", name), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return topLayerDir
+}
+
+// TestFlatComposeDepthBudget proves the flat root compose is a depth-1
+// overlay: a second overlay can stack on its merged view.
+func TestFlatComposeDepthBudget(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root to perform overlay mounts")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+		t.Fatalf("unshare: %v", err)
+	}
+	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
+		t.Fatalf("make mounts private: %v", err)
+	}
+
+	// Anchor every working dir on a tmpfs this test mounts itself (guaranteed depth 0).
+	tmpfs := tmpfsRoot(t)
+	tdir := func(name string) string {
+		p := filepath.Join(tmpfs, name)
+		if err := os.MkdirAll(p, 0755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	baseStore := tdir("base-store")
+	baseTop := fakeTwoLayerImage(t, baseStore, "d", map[string]string{"base.txt": "from-base"})
+	extStore := tdir("ext-store")
+	extTop := fakeTwoLayerImage(t, extStore, "e", map[string]string{"base.txt": "from-ext"})
+
+	baseLayers, err := buildLowerDirs(baseStore, baseTop)
+	if err != nil {
+		t.Fatalf("base buildLowerDirs: %v", err)
+	}
+	extLayers, err := buildLowerDirs(extStore, extTop)
+	if err != nil {
+		t.Fatalf("ext buildLowerDirs: %v", err)
+	}
+
+	root := tdir("root")
+	opts := BuildOverlayOptions(baseLayers, []Extension{{Name: "ext", Layers: extLayers, Priority: 0}}, nil)
+	if err := unix.Mount("overlay", root, "overlay", 0, opts); err != nil {
+		t.Fatalf("flat root mount failed: %v (opts %q)", err, opts)
+	}
+	defer unix.Unmount(root, unix.MNT_DETACH)
+
+	// Left extension shadows the base file.
+	got, err := os.ReadFile(filepath.Join(root, "base.txt"))
+	if err != nil {
+		t.Fatalf("reading merged base.txt: %v", err)
+	}
+	if string(got) != "from-ext" {
+		t.Errorf("base.txt = %q, want %q (override precedence)", got, "from-ext")
+	}
+
+	// The sealing pattern: one more overlay whose lowerdir sits on the root.
+	seal := tdir("seal")
+	dummy := tdir("dummy")
+	sealOpts := "lowerdir=" + root + ":" + dummy
+	if err := unix.Mount("overlay", seal, "overlay", 0, sealOpts); err != nil {
+		t.Fatalf("depth-2 stack on flat root rejected: %v (this is the regression the flat compose fixes)", err)
+	}
+	unix.Unmount(seal, unix.MNT_DETACH)
+
+	// Compose the two merged views (each an overlay) into a depth-2 root so
+        // the sealing overlay on top then needs depth 3 and must be rejected.
+	baseMerged := tdir("base-merged")
+	if err := unix.Mount("overlay", baseMerged, "overlay", 0, "lowerdir="+strings.Join(baseLayers, ":")); err != nil {
+		t.Fatalf("base merged mount: %v", err)
+	}
+	defer unix.Unmount(baseMerged, unix.MNT_DETACH)
+	extMerged := tdir("ext-merged")
+	if err := unix.Mount("overlay", extMerged, "overlay", 0, "lowerdir="+strings.Join(extLayers, ":")); err != nil {
+		t.Fatalf("ext merged mount: %v", err)
+	}
+	defer unix.Unmount(extMerged, unix.MNT_DETACH)
+
+	deep := tdir("deep")
+	if err := unix.Mount("overlay", deep, "overlay", 0, "lowerdir="+extMerged+":"+baseMerged); err != nil {
+		t.Fatalf("depth-2 merged-compose mount: %v", err)
+	}
+	defer unix.Unmount(deep, unix.MNT_DETACH)
+
+	seal2 := tdir("seal2")
+	if err := unix.Mount("overlay", seal2, "overlay", 0, "lowerdir="+deep+":"+dummy); err == nil {
+		unix.Unmount(seal2, unix.MNT_DETACH)
+		t.Fatal("depth-3 stack unexpectedly accepted; expected stacking-depth rejection")
+	}
+}
+
+// tmpfsRoot mounts a fresh tmpfs in a temp dir and returns its path, so
+// callers can place overlay layer dirs and mountpoints on a guaranteed
+// depth-0 filesystem regardless of what backs the ambient temp dir (a DinD
+// container's own overlay rootfs would otherwise silently add a stacking
+// level). Requires an unshared, private mount namespace. The mount is torn
+// down at test cleanup.
+func tmpfsRoot(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := unix.Mount("tmpfs", dir, "tmpfs", 0, ""); err != nil {
+		t.Fatalf("mount tmpfs on %s: %v", dir, err)
+	}
+	t.Cleanup(func() { unix.Unmount(dir, unix.MNT_DETACH) })
+	return dir
+}
+
+// opaqueMechanism probes which overlay opaque-dir xattr the running
+// environment permits and returns the xattr name plus any extra mount option
+// the flat-root overlay needs to honor it. Real root uses
+// trusted.overlay.opaque with no extra option; a rootless user namespace is
+// denied trusted.* and must use user.overlay.opaque together with the
+// userxattr mount option.
+func opaqueMechanism(t *testing.T) (xattr, mountOpt string) {
+	t.Helper()
+	probe := filepath.Join(t.TempDir(), "probe")
+	if err := os.Mkdir(probe, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setxattr(probe, "trusted.overlay.opaque", []byte("y"), 0); err == nil {
+		return "trusted.overlay.opaque", ""
+	}
+	if err := unix.Setxattr(probe, "user.overlay.opaque", []byte("y"), 0); err != nil {
+		t.Skipf("no usable overlay opaque xattr in this environment: %v", err)
+	}
+	return "user.overlay.opaque", "userxattr"
+}
+
+// TestFlatComposeWhiteoutSemantics documents the ACCEPTED semantic change of
+// the flat compose: a whiteout or opaque dir inside an extension layer hides
+// the matching hostapp entry.
+func TestFlatComposeWhiteoutSemantics(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root for mknod/setxattr/overlay mounts")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+		t.Fatalf("unshare: %v", err)
+	}
+	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
+		t.Fatalf("make mounts private: %v", err)
+	}
+
+	opaqueXattr, mountOpt := opaqueMechanism(t)
+
+	baseStore := t.TempDir()
+	baseTop := fakeTwoLayerImage(t, baseStore, "d", map[string]string{
+		"keep.conf":    "kept",
+		"removed.conf": "should-vanish",
+	})
+	baseDiff := filepath.Join(baseTop, "diff")
+	if err := os.MkdirAll(filepath.Join(baseDiff, "opq"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(baseDiff, "opq", "from-base"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	extStore := t.TempDir()
+	extTop := fakeTwoLayerImage(t, extStore, "e", nil)
+	extDiff := filepath.Join(extTop, "diff")
+	// The test runs fully under unshare -rm where mknod is permitted.
+	if err := unix.Mknod(filepath.Join(extDiff, "removed.conf"), unix.S_IFCHR|0000, 0); err != nil {
+		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+			t.Skipf("mknod denied in this environment (%v); needs unshare -rm or CAP_MKNOD", err)
+		}
+		t.Fatalf("mknod whiteout: %v", err)
+	}
+	// Opaque dir: shadows the base dir's whole content.
+	if err := os.MkdirAll(filepath.Join(extDiff, "opq"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setxattr(filepath.Join(extDiff, "opq"), opaqueXattr, []byte("y"), 0); err != nil {
+		t.Fatalf("setxattr %s: %v", opaqueXattr, err)
+	}
+	if err := os.WriteFile(filepath.Join(extDiff, "opq", "from-ext"), []byte("y"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	baseLayers, err := buildLowerDirs(baseStore, baseTop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extLayers, err := buildLowerDirs(extStore, extTop)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	opts := BuildOverlayOptions(baseLayers, []Extension{{Name: "ext", Layers: extLayers, Priority: 0}}, nil)
+	if mountOpt != "" {
+		opts += "," + mountOpt
+	}
+	if err := unix.Mount("overlay", root, "overlay", 0, opts); err != nil {
+		t.Fatalf("flat root mount failed: %v (opts %q)", err, opts)
+	}
+	defer unix.Unmount(root, unix.MNT_DETACH)
+
+	if _, err := os.ReadFile(filepath.Join(root, "keep.conf")); err != nil {
+		t.Errorf("keep.conf must survive: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "removed.conf")); !os.IsNotExist(err) {
+		t.Errorf("extension whiteout must hide base removed.conf (err=%v)", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "opq", "from-base")); !os.IsNotExist(err) {
+		t.Errorf("opaque ext dir must hide base dir content (err=%v)", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "opq", "from-ext")); err != nil {
+		t.Errorf("opaque ext dir's own content must be visible: %v", err)
+	}
+}
+
+// TestBuildOverlayOptionsDedupSharedBase verifies the flat compose lists a
+// layer shared between images exactly once, keeping the LAST occurrence.
+func TestBuildOverlayOptionsDedupSharedBase(t *testing.T) {
+	tests := []struct {
+		name            string
+		baseLayers      []string
+		leftExtensions  []Extension
+		rightExtensions []Extension
+		expected        string
+	}{
+		{
+			name:       "left extension shares the base image's bottom layer",
+			baseLayers: []string{"/h1", "/shared"},
+			leftExtensions: []Extension{
+				{Layers: []string{"/e1", "/shared"}, Name: "ext", Priority: 0},
+			},
+			expected: "lowerdir=/e1:/h1:/shared",
+		},
+		{
+			name:       "right extension shares the base image's bottom layer",
+			baseLayers: []string{"/h1", "/shared"},
+			rightExtensions: []Extension{
+				{Layers: []string{"/r1", "/shared"}, Name: "right"},
+			},
+			expected: "lowerdir=/h1:/r1:/shared",
+		},
+		{
+			name:       "two lefts share a two-layer suffix",
+			baseLayers: []string{"/h1"},
+			leftExtensions: []Extension{
+				{Layers: []string{"/e1", "/s1", "/s2"}, Name: "e1", Priority: 0},
+				{Layers: []string{"/e2", "/s1", "/s2"}, Name: "e2", Priority: 1},
+			},
+			expected: "lowerdir=/e1:/e2:/s1:/s2:/h1",
+		},
+		{
+			name:       "all images share the base, order preserved",
+			baseLayers: []string{"/h1", "/shared"},
+			leftExtensions: []Extension{
+				{Layers: []string{"/e1", "/shared"}, Name: "ext", Priority: 0},
+			},
+			rightExtensions: []Extension{
+				{Layers: []string{"/r1", "/shared"}, Name: "right"},
+			},
+			expected: "lowerdir=/e1:/h1:/r1:/shared",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := BuildOverlayOptions(tt.baseLayers, tt.leftExtensions, tt.rightExtensions)
+			if result != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, result)
+			}
+		})
+	}
+}
+
+// TestFlatComposeDedupSharedBaseKernel proves against the kernel that a base
+// layer shared by the hostapp and an override extension mounts once.
+func TestFlatComposeDedupSharedBaseKernel(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root to perform overlay mounts")
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+		t.Fatalf("unshare: %v", err)
+	}
+	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
+		t.Fatalf("make mounts private: %v", err)
+	}
+
+	store := t.TempDir()
+
+	sharedID := strings.Repeat("f", 64)
+	sharedShort := "SHAREDBASEFFFFFFFFFFFFFFFF"
+	fakeOverlay2Layer(t, store, sharedID, sharedShort)
+	sharedDiff := filepath.Join(store, sharedID, "diff")
+	for name, content := range map[string]string{"conf": "base", "shared-only": "x"} {
+		if err := os.WriteFile(filepath.Join(sharedDiff, name), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	hostID := strings.Repeat("d", 64)
+	hostShort := "HOSTTOPDDDDDDDDDDDDDDDDDDD"[:26]
+	fakeOverlay2Layer(t, store, hostID, hostShort)
+	hostDir := filepath.Join(store, hostID)
+	if err := os.WriteFile(filepath.Join(hostDir, "lower"), []byte("l/"+sharedShort), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hostDir, "diff", "conf"), []byte("host"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	extID := strings.Repeat("e", 64)
+	extShort := "EXTTOPEEEEEEEEEEEEEEEEEEEE"[:26]
+	fakeOverlay2Layer(t, store, extID, extShort)
+	extDir := filepath.Join(store, extID)
+	if err := os.WriteFile(filepath.Join(extDir, "lower"), []byte("l/"+sharedShort), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extDir, "diff", "ext-only"), []byte("y"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	baseLayers, err := buildLowerDirs(store, hostDir)
+	if err != nil {
+		t.Fatalf("hostapp buildLowerDirs: %v", err)
+	}
+	extLayers, err := buildLowerDirs(store, extDir)
+	if err != nil {
+		t.Fatalf("ext buildLowerDirs: %v", err)
+	}
+
+	opts := BuildOverlayOptions(baseLayers, []Extension{{Name: "ext", Layers: extLayers, Priority: 0}}, nil)
+	if n := strings.Count(opts, sharedShort); n != 1 {
+		t.Fatalf("shared layer listed %d times in %q, want exactly once", n, opts)
+	}
+
+	root := t.TempDir()
+	if err := unix.Mount("overlay", root, "overlay", 0, opts); err != nil {
+		t.Fatalf("flat root mount with shared base failed: %v (opts %q)", err, opts)
+	}
+	defer unix.Unmount(root, unix.MNT_DETACH)
+
+	got, err := os.ReadFile(filepath.Join(root, "conf"))
+	if err != nil {
+		t.Fatalf("reading merged conf: %v", err)
+	}
+	if string(got) != "host" {
+		t.Errorf("conf = %q, want %q: hostapp's own override must win over the shared base", got, "host")
+	}
+	for _, f := range []string{"shared-only", "ext-only"} {
+		if _, err := os.Stat(filepath.Join(root, f)); err != nil {
+			t.Errorf("%s missing from merged root: %v", f, err)
+		}
 	}
 }
