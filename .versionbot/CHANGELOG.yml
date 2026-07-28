@@ -1,4 +1,68 @@
 - commits:
+    - subject: "hostapp: compose the root as a flat single depth overlay"
+      hash: 9df64079b61a6a1a9bca0674367078564a3f55f5
+      body: >
+        The kernel has a maximum stacking budget (FILESYSTEM_MAX_STACK_DEPTH) of
+        2,
+
+        and the current overlay depth of 2 exhaust it.
+
+
+        The result is that when runc tries to mount one more overlay on top it
+
+        was rejeced. This is benign as runc falls back to a workaround, but it
+
+        does fill the log with kernel warnings.
+
+
+        This change composes one flat lowerdir that becomes a single layer
+
+        overlay avoiding the problem above. It also dedups shared layers so
+
+        they only appear once.
+      footer:
+        Change-type: minor
+        change-type: minor
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+    - subject: "hostapp: reference overlay layers by short symlink"
+      hash: 4d5e7bc0341c83dca179e38fb028af5a5c4a35b4
+      body: |
+        The lowerdir mount options string is capped at one kernel page.
+
+        Using short symlinks maximizes the number of extensions that can be
+        mounted.
+      footer:
+        Change-type: minor
+        change-type: minor
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+    - subject: "hostapp: use kernel image hash as kernel abi id"
+      hash: 5797015c22c4daa4a7406affd5710691585ee510
+      body: |
+        Although Module.symvers used as kernel abi id covers
+        most use cases, in particular kernel modules, two rebuilds
+        of one kernel config with the same Module.symvers carry
+        incompatible vmlinux/module BTF, so the kernel abi id as is
+        cannot be used to disambinguate.
+
+        This commit uses the hash of the kernel image instead which
+        covers all use cases.
+      footer:
+        Change-type: minor
+        change-type: minor
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+  version: 1.1.0
+  title: ""
+  date: 2026-07-28T14:32:48.382Z
+- commits:
     - subject: "hostapp: add kernel version ABI extension filtering"
       hash: 230faf1f4e0cae0d6f20b0de8c99232844f6a714
       body: >
