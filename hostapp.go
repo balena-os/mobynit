@@ -38,6 +38,7 @@ type Container struct {
 	Config
 	MountPath string
 	HomePath  string
+	Layers []string
 }
 
 var (
@@ -46,6 +47,51 @@ var (
 	// Verbose enables verbose logging
 	Verbose bool = false
 )
+
+// shortLinkFor returns the overlay2/l/<short> symlink path for a layer
+// directory, reading the layer's own link file.
+func shortLinkFor(overlay2Dir, layerDir string) (string, error) {
+	linkBytes, err := os.ReadFile(filepath.Join(layerDir, "link"))
+	if err != nil {
+		return "", fmt.Errorf("reading link file for %s: %w", layerDir, err)
+	}
+	return filepath.Join(overlay2Dir, "l", strings.TrimSpace(string(linkBytes))), nil
+}
+
+// buildLowerDirs returns the readonly overlay lowerdir list for a top layer:
+// the top layer first, then its parent chain, every entry referenced by the
+// engine's compact overlay2/l/<short> symlink. Init layers are dropped.
+func buildLowerDirs(overlay2Dir, layerDir string) ([]string, error) {
+	top, err := shortLinkFor(overlay2Dir, layerDir)
+	if err != nil {
+		return nil, err
+	}
+	lowerDirs := []string{top}
+
+	lowerBytes, err := os.ReadFile(filepath.Join(layerDir, "lower"))
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("reading lower file: %w", err)
+	}
+	if len(lowerBytes) == 0 {
+		return lowerDirs, nil
+	}
+
+	for _, link := range strings.Split(strings.TrimSpace(string(lowerBytes)), ":") {
+		linkPath := filepath.Join(overlay2Dir, link)
+		target, err := os.Readlink(linkPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolving %s: %w", link, err)
+		}
+		if strings.Contains(target, "-init/") {
+			if Debug {
+				log.Printf("Skipping init layer: %s", target)
+			}
+			continue
+		}
+		lowerDirs = append(lowerDirs, linkPath)
+	}
+	return lowerDirs, nil
+}
 
 // mount mounts the container's overlay filesystem using direct overlay2 metadata reading
 func (container *Container) mount(layerRoot string) (string, error) {
@@ -64,37 +110,9 @@ func (container *Container) mount(layerRoot string) (string, error) {
 	overlay2Dir := filepath.Join(layerRoot, "overlay2")
 	layerDir := filepath.Join(overlay2Dir, mountID)
 
-	// The layer's own diff directory - this is the top layer
-	diffDir := filepath.Join(layerDir, "diff")
-
-	// Read lower file to get parent layer chain
-	lowerPath := filepath.Join(layerDir, "lower")
-	lowerBytes, err := os.ReadFile(lowerPath)
-	if err != nil && !os.IsNotExist(err) {
-		return "", fmt.Errorf("reading lower file: %w", err)
-	}
-
-	// Build lowerdir list: diff first, then all parent layers (including init)
-	// For readonly overlay, diff is part of lowerdir (no upperdir)
-	lowerDirs := []string{diffDir}
-
-	if len(lowerBytes) > 0 {
-		links := strings.Split(strings.TrimSpace(string(lowerBytes)), ":")
-		for _, link := range links {
-			resolved, err := filepath.EvalSymlinks(filepath.Join(overlay2Dir, link))
-			if err != nil {
-				return "", fmt.Errorf("resolving %s: %w", link, err)
-			}
-			// Skip init layers - they contain .dockerenv which causes
-			// systemd to detect container mode
-			if strings.Contains(resolved, "-init/") {
-				if Debug {
-					log.Printf("Skipping init layer: %s", resolved)
-				}
-				continue
-			}
-			lowerDirs = append(lowerDirs, resolved)
-		}
+	lowerDirs, err := buildLowerDirs(overlay2Dir, layerDir)
+	if err != nil {
+		return "", err
 	}
 
 	// Mount point: overlay2/<mount-id>/merged
@@ -114,14 +132,15 @@ func (container *Container) mount(layerRoot string) (string, error) {
 	}
 
 	container.MountPath = mountPoint
+	container.Layers = lowerDirs
 	log.Printf("Mounted ID %s in %s\n", container.ID, container.MountPath)
 
 	return container.MountPath, nil
 }
 
-// unmount releases the container's overlay filesystem. It is a no-op for a
-// container that was never mounted (MountPath == "").
-func (container *Container) unmount() error {
+// Unmount releases the container's overlay filesystem. It is a no-op for a
+// container that was never mounted.
+func (container *Container) Unmount() error {
 	if container.MountPath == "" {
 		return nil
 	}
@@ -273,7 +292,7 @@ func FilterByKernelVersion(containers []Container, kernelVersion string) []Conta
 }
 
 // ComputeABIID returns the hex-encoded sha256 of the file at path.
-// Used to derive io.balena.image.kernel-abi-id from Module.symvers.
+// Used to derive io.balena.image.kernel-abi-id from the kernel image.
 func ComputeABIID(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -287,16 +306,20 @@ func ComputeABIID(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// ResolveExtensionABIID computes the container's kernel ABI ID as
-// sha256(<mount>/lib/modules/<release>/Module.symvers), where release is the
-// running kernel's uname release.
+// ResolveExtensionABIID returns the extension's kernel identity claim.
+// * The extension carries a modules tree
+// * A file directly under the extension's /boot (the shipped kernel image)
+//   hashes to hostABIID, the balena_kernel_abi cmdline token.
 //
-// Returns "" with no error if the extension carries no kernel modules for the
-// running release. Returns an error if /lib/modules/<release> exists
-// but Module.symvers is missing (broken extension), if the label disagrees with
-// the computed value, or if a module-carrying extension cannot be verified
-// because release is empty (running kernel unknown).
-func (c *Container) ResolveExtensionABIID(release string) (string, error) {
+// Returns "" (no claim) when:
+// * The extension is unmounted
+// * Carries no modules tree
+// * carries one for another release
+//
+// Returns errors when an extension claims the running release but cannot be
+// matched to the running kernel: unknown release, stock kernel (empty
+// hostABIID), no /boot, or no /boot file hashing to hostABIID.
+func (c *Container) ResolveExtensionABIID(release, hostABIID string) (string, error) {
 	if c.MountPath == "" {
 		return "", nil
 	}
@@ -319,44 +342,60 @@ func (c *Container) ResolveExtensionABIID(release string) (string, error) {
 		}
 		return "", fmt.Errorf("stat %s: %w", modDir, err)
 	}
-	symversPath := filepath.Join(modDir, "Module.symvers")
-	if _, err := os.Stat(symversPath); err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("broken extension %s: %s missing", c.Name, symversPath)
-		}
-		return "", fmt.Errorf("stat %s: %w", symversPath, err)
+
+	if hostABIID == "" {
+		return "", fmt.Errorf("extension %s: kernel-carrying but running kernel is stock", c.Name)
 	}
-	id, err := ComputeABIID(symversPath)
+
+	// The kernel-abi-id label is advisory: warn on absence or divergence for
+	// observability, but never gate the mount on it.
+	if labelVal := c.Labels[HOSTOS_BLOCKS_KERNEL_ABI_ID]; labelVal == "" {
+		log.Printf("Warning: extension %s: modules present but no %s label", c.Name, HOSTOS_BLOCKS_KERNEL_ABI_ID)
+	} else if labelVal != hostABIID {
+		log.Printf("Warning: extension %s: %s label %q != running kernel %q; using image match", c.Name, HOSTOS_BLOCKS_KERNEL_ABI_ID, labelVal, hostABIID)
+	}
+
+	bootDir := filepath.Join(c.MountPath, "boot")
+	entries, err := os.ReadDir(bootDir)
 	if err != nil {
-		return "", err
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("broken extension %s: modules present but no kernel image under /boot", c.Name)
+		}
+		return "", fmt.Errorf("broken extension %s: reading %s: %w", c.Name, bootDir, err)
 	}
-	if labelVal, ok := c.Labels[HOSTOS_BLOCKS_KERNEL_ABI_ID]; ok && labelVal != "" && labelVal != id {
-		return "", fmt.Errorf("extension %s: %s label %q != computed %q",
-			c.Name, HOSTOS_BLOCKS_KERNEL_ABI_ID, labelVal, id)
+	for _, e := range entries {
+		// Regular files only: following a symlink would let the bytes we
+		// verify live outside the extension being verified.
+		if !e.Type().IsRegular() {
+			continue
+		}
+		id, err := ComputeABIID(filepath.Join(bootDir, e.Name()))
+		if err != nil {
+			// One unreadable file must not mask a valid match elsewhere
+			// under /boot; a genuine no-match still fails below.
+			log.Printf("Warning: extension %s: skipping unreadable /boot file: %v", c.Name, err)
+			continue
+		}
+		if id == hostABIID {
+			return id, nil
+		}
 	}
-	return id, nil
+	return "", fmt.Errorf("extension %s: no /boot kernel image matches running kernel %q", c.Name, hostABIID)
 }
 
 // FilterByKernelABIID keeps only those containers safe to mount over the
 // running kernel.
 //
 // An ABI-agnostic extension makes no kernel-ABI claim and always passes.
-// A kernel-carrying extension is kept only when its computed ABI equals hostABIID.
+// A kernel-carrying extension is kept only when one of its /boot images
+// hashes to hostABIID; ResolveExtensionABIID errors otherwise, so no
+// further comparison is needed here.
 func FilterByKernelABIID(containers []Container, release, hostABIID string) []Container {
 	var filtered []Container
 	for i := range containers {
 		c := &containers[i]
-		id, err := c.ResolveExtensionABIID(release)
-		if err != nil {
+		if _, err := c.ResolveExtensionABIID(release, hostABIID); err != nil {
 			log.Printf("Error: dropping container %s: %v", c.Name, err)
-			continue
-		}
-		if id == "" {
-			filtered = append(filtered, *c)
-			continue
-		}
-		if id != hostABIID {
-			log.Printf("Skipping container %s: kernel ABI ID %q != host %q", c.Name, id, hostABIID)
 			continue
 		}
 		filtered = append(filtered, *c)
@@ -379,34 +418,56 @@ func SelectMountable(containers []Container, release, hostABIID string) []Contai
 		if keep[containers[i].MountPath] {
 			continue
 		}
-		if err := containers[i].unmount(); err != nil {
+		if err := containers[i].Unmount(); err != nil {
 			log.Printf("Warning: failed to unmount dropped extension %s: %v", containers[i].Name, err)
 		}
 	}
 	return selected
 }
 
-// Extension represents an OS-block overlay extension. Extensions passed in
-// the leftExtensions slice of BuildOverlayOptions mount left of the hostapp
-// in lowerdir at their Priority (lower = higher overlayfs precedence, ties
-// broken by Name). Extensions passed in rightExtensions mount right of the
-// hostapp; their Priority field is ignored.
-type Extension struct {
-	Name      string
-	MountPath string
-	Priority  int
+// dedupLayers drops repeated layer references, keeping the LAST occurrence
+// of each. Overlayfs rejects a lowerdir naming the same directory twice
+// (ELOOP).
+func dedupLayers(layers []string) []string {
+	seen := make(map[string]struct{}, len(layers))
+	out := make([]string, 0, len(layers))
+	for i := len(layers) - 1; i >= 0; i-- {
+		if _, dup := seen[layers[i]]; dup {
+			if Debug {
+				log.Printf("Dropping duplicate shared layer %s", layers[i])
+			}
+			continue
+		}
+		seen[layers[i]] = struct{}{}
+		out = append(out, layers[i])
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out
 }
 
-// BuildOverlayOptions constructs an overlay lowerdir mount options string.
-// leftExtensions mount left of basePath (taking overlayfs precedence over it)
-// sorted by Priority ascending with Name as tie-breaker. rightExtensions mount
-// right of basePath in the order given. basePath is always included.
+// Extension represents an OS-block overlay extension as a layer chain.
+// Extensions passed in the leftExtensions slice of BuildOverlayOptions layer
+// left of the base chain in lowerdir at their Priority (lower = higher
+// overlayfs precedence, ties broken by Name). Extensions passed in
+// rightExtensions layer right of the base chain; their Priority field is
+// ignored.
+type Extension struct {
+	Name     string
+	Layers   []string
+	Priority int
+}
+
+// BuildOverlayOptions constructs a flat overlay lowerdir mount options string
+// from per-image layer chains.
 //
-// Extensions that would push the options string past the kernel page-size
-// limit are dropped: rightExtensions first, then the lowest-priority
-// leftExtensions. Drops are logged per name. The set of extensions that fit
-// is logged in mount order.
-func BuildOverlayOptions(basePath string, leftExtensions, rightExtensions []Extension) string {
+// Extensions whose chain would push the options string past the kernel
+// page-size limit are dropped as WHOLE chains (a partial chain would compose
+// a partial image): rightExtensions first, then the lowest-priority
+// leftExtensions. Drops are logged per name. The set that fits is logged in
+// mount order.
+func BuildOverlayOptions(baseLayers []string, leftExtensions, rightExtensions []Extension) string {
 	sort.Slice(leftExtensions, func(i, j int) bool {
 		if leftExtensions[i].Priority != leftExtensions[j].Priority {
 			return leftExtensions[i].Priority < leftExtensions[j].Priority
@@ -415,28 +476,29 @@ func BuildOverlayOptions(basePath string, leftExtensions, rightExtensions []Exte
 	})
 
 	pageLimit := os.Getpagesize() - 1
+	base := strings.Join(baseLayers, ":")
 
-	// Phase 1: prepend leftExtensions (highest priority first) while basePath still fits
 	prefix := "lowerdir="
 	leftIncluded := 0
 	for _, e := range leftExtensions {
-		candidate := prefix + e.MountPath + ":" + basePath
+		chain := strings.Join(e.Layers, ":")
+		candidate := prefix + chain + ":" + base
 		if len(candidate) >= pageLimit {
 			break
 		}
-		prefix += e.MountPath + ":"
+		prefix += chain + ":"
 		leftIncluded++
 	}
 	for _, e := range leftExtensions[leftIncluded:] {
 		log.Printf("Warning: extension %q dropped due to page size limit", e.Name)
 	}
 
-	opts := prefix + basePath
+	opts := prefix + base
 
 	// Phase 2: append rightExtensions as space allows
 	rightIncluded := 0
 	for _, e := range rightExtensions {
-		candidate := opts + ":" + e.MountPath
+		candidate := opts + ":" + strings.Join(e.Layers, ":")
 		if len(candidate) >= pageLimit {
 			break
 		}
@@ -447,19 +509,22 @@ func BuildOverlayOptions(basePath string, leftExtensions, rightExtensions []Exte
 		log.Printf("Warning: extension %q dropped due to page size limit", e.Name)
 	}
 
+	// Dedup shared layers AFTER the page-budget drops
+	opts = "lowerdir=" + strings.Join(dedupLayers(strings.Split(strings.TrimPrefix(opts, "lowerdir="), ":")), ":")
+
 	// Log what fit, in mount order
 	log.Println("Overlayed images:")
 	idx := 0
 	for i := 0; i < leftIncluded; i++ {
 		e := leftExtensions[i]
-		log.Printf("\t[%d] %s (left, priority=%d)", idx, e.Name, e.Priority)
+		log.Printf("\t[%d] %s (left, priority=%d, %d layers)", idx, e.Name, e.Priority, len(e.Layers))
 		idx++
 	}
-	log.Printf("\t[%d] %s (hostapp)", idx, basePath)
+	log.Printf("\t[%d] hostapp (%d layers)", idx, len(baseLayers))
 	idx++
 	for i := 0; i < rightIncluded; i++ {
 		e := rightExtensions[i]
-		log.Printf("\t[%d] %s (right)", idx, e.Name)
+		log.Printf("\t[%d] %s (right, %d layers)", idx, e.Name, len(e.Layers))
 		idx++
 	}
 

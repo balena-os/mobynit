@@ -37,11 +37,11 @@ mobynit -dataFstype=ext4  # Data partition filesystem type (default: ext4)
 
 ### Overlay mount ordering
 
-OS block containers (labelled `io.balena.image.class=overlay`) are mounted as
+OS block containers (labelled `io.balena.image.class=overlay`) are layered as
 overlayfs lowerdirs alongside the hostapp. Their position relative to the
 hostapp determines whether they can replace hostapp files or only add new ones.
 
-In overlayfs, `lowerdir=A:B:C` means A has highest lookup priority — a file
+In overlayfs, `lowerdir=A:B:C` means A has highest lookup priority: a file
 in A shadows the same path in B and C.
 
 There are two types of OS blocks:
