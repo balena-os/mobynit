@@ -1781,3 +1781,356 @@ func TestFlatComposeDedupSharedBaseKernel(t *testing.T) {
 		}
 	}
 }
+
+// storeEntry describes one container record in a synthetic engine store.
+type storeEntry struct {
+	dir               string
+	id                string
+	name              string
+	class             string // class label value; "" omits the label
+	abi               string // kernel-abi-id label value; "" omits the label
+	dead              bool
+	removalInProgress bool
+}
+
+// writeStore lays out <root>/containers/<dir>/config.v2.json for each entry
+// and returns the docker data root, the argument readContainers takes.
+func writeStore(t *testing.T, entries ...storeEntry) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, e := range entries {
+		labels := map[string]interface{}{}
+		if e.class != "" {
+			labels[HOSTOS_BLOCKS_CLASS] = e.class
+		}
+		if e.abi != "" {
+			labels[HOSTOS_BLOCKS_KERNEL_ABI_ID] = e.abi
+		}
+		record := map[string]interface{}{
+			"ID":     e.id,
+			"Name":   e.name,
+			"Driver": "overlay2",
+			"Config": map[string]interface{}{"Labels": labels},
+			"State": map[string]interface{}{
+				"Dead":              e.dead,
+				"RemovalInProgress": e.removalInProgress,
+			},
+		}
+		home := filepath.Join(root, "containers", e.dir)
+		if err := os.MkdirAll(home, 0755); err != nil {
+			t.Fatal(err)
+		}
+		out, err := json.Marshal(record)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", e.dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(home, "config.v2.json"), out, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+func TestReadContainers(t *testing.T) {
+	t.Run("selects extensions by class label", func(t *testing.T) {
+		root := writeStore(t,
+			storeEntry{dir: "01", id: "aaa1", name: "ext", class: "overlay"},
+			storeEntry{dir: "02", id: "bbb2", name: "app"},
+			storeEntry{dir: "03", id: "ccc3", name: "other-class", class: "service"},
+		)
+		got, err := readContainers(root, HOSTOS_BLOCKS_CLASS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].Name != "ext" {
+			t.Fatalf("got %v, want just the overlay-classed container", names(got))
+		}
+	})
+
+	// mountSysroot matches the hostapp by ID prefix, so keep that arm
+	t.Run("selects the hostapp by ID prefix", func(t *testing.T) {
+		root := writeStore(t,
+			storeEntry{dir: "01", id: "deadbeefcafe", name: "hostapp"},
+			storeEntry{dir: "02", id: "0badc0de", name: "ext", class: "overlay"},
+		)
+		got, err := readContainers(root, "deadbeef")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].Name != "hostapp" {
+			t.Fatalf("got %v, want just the hostapp", names(got))
+		}
+	})
+
+	t.Run("drops dead and removal-in-progress containers", func(t *testing.T) {
+		root := writeStore(t,
+			storeEntry{dir: "01", id: "aaa1", name: "live", class: "overlay"},
+			storeEntry{dir: "02", id: "bbb2", name: "dead", class: "overlay", dead: true},
+			storeEntry{dir: "03", id: "ccc3", name: "going", class: "overlay", removalInProgress: true},
+		)
+		got, err := readContainers(root, HOSTOS_BLOCKS_CLASS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].Name != "live" {
+			t.Fatalf("got %v, want just the live container", names(got))
+		}
+	})
+
+	t.Run("skips an unreadable record without failing the walk", func(t *testing.T) {
+		root := writeStore(t,
+			storeEntry{dir: "01", id: "aaa1", name: "good", class: "overlay"},
+			storeEntry{dir: "02", id: "bbb2", name: "corrupt", class: "overlay"},
+		)
+		bad := filepath.Join(root, "containers", "02", "config.v2.json")
+		if err := os.WriteFile(bad, []byte("{not json"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := readContainers(root, HOSTOS_BLOCKS_CLASS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].Name != "good" {
+			t.Fatalf("got %v, want the readable container only", names(got))
+		}
+	})
+
+	t.Run("ignores non-directory entries", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "ext", class: "overlay"})
+		if err := os.WriteFile(filepath.Join(root, "containers", "stray"), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := readContainers(root, HOSTOS_BLOCKS_CLASS)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("got %v, want one container", names(got))
+		}
+	})
+
+	// Only ClaimedKernelABIs softens a missing store; the mount path fails
+	t.Run("missing store is an error for the mount path", func(t *testing.T) {
+		if _, err := initializeContainers(t.TempDir(), HOSTOS_BLOCKS_CLASS); err == nil {
+			t.Fatal("expected an error for a store with no containers directory")
+		}
+	})
+}
+
+func names(containers []Container) []string {
+	var out []string
+	for _, c := range containers {
+		out = append(out, c.Name)
+	}
+	return out
+}
+
+func TestClaimedKernelABIs(t *testing.T) {
+	// Full-width digests: the query only accepts a sha256 hex label
+	const abiA = "1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa"
+	const abiB = "2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb"
+
+	t.Run("reports the ABI of a live extension", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "km", class: "overlay", abi: abiA})
+		got, err := ClaimedKernelABIs(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, []string{abiA}) {
+			t.Errorf("got %v, want %v", got, []string{abiA})
+		}
+	})
+
+	t.Run("a malformed label is not a claim", func(t *testing.T) {
+		cases := map[string]string{
+			"newline":   abiA + "\n" + abiB,
+			"short":     "1111aaaa",
+			"uppercase": strings.ToUpper(abiA),
+			"non-hex":   strings.Repeat("z", abiIDLen),
+			"padded":    " " + abiA,
+		}
+		for name, label := range cases {
+			t.Run(name, func(t *testing.T) {
+				root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "km", class: "overlay", abi: label})
+				got, err := ClaimedKernelABIs(root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(got) != 0 {
+					t.Errorf("got %v, want no claims", got)
+				}
+			})
+		}
+	})
+
+	// A neighbour's bad label must not cost a valid claimant its kernel
+	t.Run("a malformed label does not hide a valid one", func(t *testing.T) {
+		root := writeStore(t,
+			storeEntry{dir: "01", id: "aaa1", name: "bad", class: "overlay", abi: abiA + "\n" + abiB},
+			storeEntry{dir: "02", id: "bbb2", name: "good", class: "overlay", abi: abiB},
+		)
+		got, err := ClaimedKernelABIs(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, []string{abiB}) {
+			t.Errorf("got %v, want %v", got, []string{abiB})
+		}
+	})
+
+	// Orphaned override: the bootenv arm outlives the extension
+	t.Run("a removed extension claims nothing", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "app"})
+		got, err := ClaimedKernelABIs(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no claims", got)
+		}
+	})
+
+	// The mount path drops these; a claim would boot a kernel with no modules
+	t.Run("dead and removal-in-progress extensions do not claim", func(t *testing.T) {
+		root := writeStore(t,
+			storeEntry{dir: "01", id: "aaa1", name: "dead", class: "overlay", abi: abiA, dead: true},
+			storeEntry{dir: "02", id: "bbb2", name: "going", class: "overlay", abi: abiB, removalInProgress: true},
+		)
+		got, err := ClaimedKernelABIs(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no claims", got)
+		}
+	})
+
+	t.Run("non-overlay containers do not claim", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "app", abi: abiA})
+		got, err := ClaimedKernelABIs(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no claims", got)
+		}
+	})
+
+	t.Run("an ABI-agnostic extension does not claim", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "agnostic", class: "overlay"})
+		got, err := ClaimedKernelABIs(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no claims", got)
+		}
+	})
+
+	t.Run("deduplicates and sorts", func(t *testing.T) {
+		root := writeStore(t,
+			storeEntry{dir: "01", id: "aaa1", name: "later", class: "overlay", abi: abiB},
+			storeEntry{dir: "02", id: "bbb2", name: "earlier", class: "overlay", abi: abiA},
+			storeEntry{dir: "03", id: "ccc3", name: "twin", class: "overlay", abi: abiB},
+		)
+		got, err := ClaimedKernelABIs(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, []string{abiA, abiB}) {
+			t.Errorf("got %v, want %v", got, []string{abiA, abiB})
+		}
+	})
+
+	// Unpopulated data root is unavailable, not an empty set.
+	t.Run("missing containers directory is unavailable", func(t *testing.T) {
+		got, err := ClaimedKernelABIs(t.TempDir())
+		if !errors.Is(err, ErrClaimsUnavailable) {
+			t.Fatalf("got %v, want ErrClaimsUnavailable", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no claims", got)
+		}
+	})
+
+	// The only state answering with an empty claim set.
+	t.Run("containers present with no claimant is an empty claim set", func(t *testing.T) {
+		root := writeStore(t,
+			storeEntry{dir: "01", id: "aaa1", name: "agnostic", class: "overlay"},
+			storeEntry{dir: "02", id: "bbb2", name: "app"},
+		)
+		got, err := ClaimedKernelABIs(root)
+		if err != nil {
+			t.Fatalf("want a nil error for an empty claim set, got %v", err)
+		}
+		if got != nil {
+			t.Errorf("got %v, want a nil claim set", got)
+		}
+	})
+
+	// An absent data root must not read as an empty store
+	t.Run("an absent data root is an error", func(t *testing.T) {
+		if _, err := ClaimedKernelABIs(filepath.Join(t.TempDir(), "absent")); err == nil {
+			t.Fatal("expected an error for an absent data root")
+		}
+	})
+
+	// "cannot tell" must stay distinct from "nothing claims it"
+	t.Run("an unreadable store is an error", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "containers"), []byte("not a directory"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ClaimedKernelABIs(root); err == nil {
+			t.Fatal("expected an error when the containers path is not a directory")
+		}
+	})
+
+	t.Run("an unsearchable store is an error", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skip("root ignores directory permissions")
+		}
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "km", class: "overlay", abi: abiA})
+		containers := filepath.Join(root, "containers")
+		if err := os.Chmod(containers, 0); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chmod(containers, 0755)
+		if _, err := ClaimedKernelABIs(root); err == nil {
+			t.Fatal("expected an error for an unreadable containers directory")
+		}
+	})
+
+	// The bootloader initramfs runs this against a read-only mount
+	t.Run("does not write to the store", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "km", class: "overlay", abi: abiA})
+		before := treeSnapshot(t, root)
+		if _, err := ClaimedKernelABIs(root); err != nil {
+			t.Fatal(err)
+		}
+		if after := treeSnapshot(t, root); !reflect.DeepEqual(before, after) {
+			t.Errorf("store changed during the query:\nbefore %v\nafter  %v", before, after)
+		}
+	})
+}
+
+// treeSnapshot records every path under root with its size.
+func treeSnapshot(t *testing.T, root string) map[string]int64 {
+	t.Helper()
+	out := map[string]int64{}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		out[rel] = info.Size()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s: %v", root, err)
+	}
+	return out
+}

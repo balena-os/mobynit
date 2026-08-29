@@ -33,7 +33,42 @@ Mobynit is designed to run as PID 1 in an initramfs. It:
 ```
 mobynit -sysroot=/path  # Mount sysroot and print path (for updates)
 mobynit -dataFstype=ext4  # Data partition filesystem type (default: ext4)
+mobynit -claimed-abis=/path  # Print claimed kernel ABI ids and exit
 ```
+
+### Reporting claimed kernel ABIs
+
+`-claimed-abis=<docker data root>` prints the
+`io.balena.image.kernel-abi-id` of every OS block container in the store. It
+prints one id per line, then exits.
+
+The output is a set. Its order carries no meaning: the sort only makes the
+output stable for comparison and for tests. A caller holds the ABI it is
+asking about and tests for membership.
+
+The query drops dead containers and containers marked for removal, as the
+mount path does. A container that contributes no modules must not keep a
+kernel bootable.
+
+A label that is not a lowercase sha256 hex digest is not a claim. The query
+logs it and drops it. Callers match whole lines. A label carrying a newline
+would otherwise print an id its extension does not own.
+
+A claim is not a guarantee. Activation proved the label against the kernel
+bytes, but the pid 1 mount path applies filters this query does not model,
+and any of them can still drop the extension after the kexec.
+
+Exit codes are the contract:
+
+| Exit | Meaning |
+|------|---------|
+| 0, lines on stdout | deployed extensions claim these ABIs |
+| 0, no output | no deployed extension claims an ABI |
+| non-zero | this binary cannot answer: the argument is empty, or the binary predates the flag |
+
+A store that mobynit cannot read claims nothing. The query and the pid 1 mount
+path read the same store with the same code. A store that fails to read now
+also fails at pid 1. That boot mounts no modules.
 
 ### Overlay mount ordering
 
