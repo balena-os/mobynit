@@ -6,6 +6,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -84,7 +85,6 @@ func unescapeMountpoint(s string) string {
 const (
 	HOSTAPP_LAYER_ROOT       = "balena"
 	PIVOT_PATH               = "/mnt/sysroot/active"
-	HOSTOS_BLOCKS_CLASS      = "io.balena.image.class"
 	LOG_DIR                  = "/tmp/initramfs/"
 	LOG_FILE                 = "initramfs.debug"
 	CMDLINE_DISABLE_OVERLAYS = "mobynit.no_overlays"
@@ -193,7 +193,7 @@ func mountDataOverlays(newRootPath string, baseLayers []string) error {
 		return nil
 	}
 
-	containers, err := hostapp.Mount(filepath.Join(newRootPath, string(os.PathSeparator), filepath.Join(DATA_DIR_NAME, string(os.PathSeparator), DATA_LAYER_ROOT)), HOSTOS_BLOCKS_CLASS)
+	containers, err := hostapp.Mount(filepath.Join(newRootPath, string(os.PathSeparator), filepath.Join(DATA_DIR_NAME, string(os.PathSeparator), DATA_LAYER_ROOT)), hostapp.HOSTOS_BLOCKS_CLASS)
 	if err != nil {
 		return err
 	}
@@ -311,8 +311,36 @@ func prepareForPivot() (string, error) {
 
 func main() {
 	sysrootPtr := flag.String("sysroot", "", "root of partition e.g. /mnt/sysroot/inactive. Mount destination is returned in stdout")
+	claimedPtr := flag.String("claimed-abis", "", "docker data root to report the kernel ABI ids claimed by deployed extensions for, one per line, then exit")
 	flag.StringVar(&dataFstype, "dataFstype", "ext4", "Filesystem type for the data partition. Defaults to ext4.")
 	flag.Parse()
+
+	// A read-only query, run from the bootloader initramfs before the kexec.
+	// It must mount nothing and write nothing, so it returns ahead of the log
+	// directory setup and of everything that reads /proc/cmdline. A flag given
+	// with an empty value (a botched shell variable in the bootloader script)
+	// must fail closed here rather than fall through into the pid-1 boot
+	// sequence, which would mount and pivot inside the bootloader initramfs.
+	claimedGiven := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "claimed-abis" {
+			claimedGiven = true
+		}
+	})
+	if claimedGiven {
+		if *claimedPtr == "" {
+			log.Fatalln("-claimed-abis requires a docker data root path")
+		}
+		abis, err := hostapp.ClaimedKernelABIs(*claimedPtr)
+		// Cannot tell means claim nothing, as kexec expects
+		if err != nil && !errors.Is(err, hostapp.ErrClaimsUnavailable) {
+			log.Fatalln("Error reading claimed kernel ABIs:", err)
+		}
+		for _, abi := range abis {
+			fmt.Println(abi)
+		}
+		return
+	}
 
 	if sysrootPtr != nil && *sysrootPtr != "" {
 		var containers []hostapp.Container

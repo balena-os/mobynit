@@ -33,7 +33,31 @@ Mobynit is designed to run as PID 1 in an initramfs. It:
 ```
 mobynit -sysroot=/path  # Mount sysroot and print path (for updates)
 mobynit -dataFstype=ext4  # Data partition filesystem type (default: ext4)
+mobynit -claimed-abis=/path  # Print claimed kernel ABI ids and exit
 ```
+
+### Reporting claimed kernel ABIs
+
+`-claimed-abis=<docker data root>` prints, one per line, the
+`io.balena.image.kernel-abi-id` of every OS block container in the store,
+then exits.
+
+Dead and removal-in-progress containers are excluded, matching the mount path:
+a container that contributes no modules must not keep a kernel bootable.
+
+The query trusts the labels as deployed. The boot path additionally filters
+extensions against the running kernel and skips containers whose overlays fail
+to mount, but those checks need a mounted extension and a chosen kernel, which
+the query's answer itself determines. A container with a stale label therefore
+keeps its claim until it is removed from the store.
+
+Exit codes are the contract:
+
+| Exit | Meaning |
+|------|---------|
+| 0, lines on stdout | these ABIs are claimed |
+| 0, no output | nothing is claimed |
+| non-zero | the data root is absent, the argument is empty or the store could not be read; the caller cannot tell |
 
 ### Overlay mount ordering
 

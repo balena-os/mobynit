@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -173,15 +174,18 @@ func (container *Container) initialize(homePath string) error {
 	return nil
 }
 
-// initializeContainers finds and mounts containers
-func initializeContainers(rootdir string, match string) ([]Container, error) {
+// readContainers returns the container records under rootdir matching match,
+// without mounting anything. Dead and removal-in-progress containers are
+// dropped here because they contribute nothing to a boot; every caller must
+// see the same set the mount path does, so this exclusion has a single home.
+func readContainers(rootdir string, match string) ([]Container, error) {
 	containersDir := filepath.Join(rootdir, "containers")
 	entries, err := os.ReadDir(containersDir)
 	if err != nil {
 		return nil, fmt.Errorf("reading containers directory: %w", err)
 	}
 
-	var mountedContainers []Container
+	var found []Container
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -214,11 +218,27 @@ func initializeContainers(rootdir string, match string) ([]Container, error) {
 			continue
 		}
 
-		if _, err := container.mount(rootdir); err != nil {
+		found = append(found, container)
+	}
+
+	return found, nil
+}
+
+// initializeContainers finds and mounts containers
+func initializeContainers(rootdir string, match string) ([]Container, error) {
+	containers, err := readContainers(rootdir, match)
+	if err != nil {
+		return nil, err
+	}
+
+	var mountedContainers []Container
+
+	for i := range containers {
+		if _, err := containers[i].mount(rootdir); err != nil {
 			log.Println("Failed to mount container:", err)
-		} else {
-			mountedContainers = append(mountedContainers, container)
+			continue
 		}
+		mountedContainers = append(mountedContainers, containers[i])
 	}
 
 	return mountedContainers, nil
@@ -233,11 +253,62 @@ func Mount(rootdir string, label string) ([]Container, error) {
 }
 
 const (
+	HOSTOS_BLOCKS_CLASS          = "io.balena.image.class"
 	HOSTOS_BLOCKS_OVERRIDE       = "io.balena.image.override"
 	HOSTOS_BLOCKS_KERNEL_VERSION = "io.balena.image.kernel-version"
 	HOSTOS_BLOCKS_KERNEL_ABI_ID  = "io.balena.image.kernel-abi-id"
 	CMDLINE_KERNEL_ABI           = "balena_kernel_abi"
 )
+
+// ErrClaimsUnavailable reports that the deployed kernel ABI claims cannot be
+// determined from the store.
+var ErrClaimsUnavailable = errors.New("cannot determine the deployed kernel ABI claims")
+
+// ClaimedKernelABIs returns the kernel ABI ids claimed by the OS block
+// containers in the store, read straight from the container store with no
+// engine running.
+//
+// Three states, which callers read differently:
+//
+//	data root absent                          the stat error
+//	containers directory missing              ErrClaimsUnavailable
+//	containers present, none claiming an ABI  nil, nil
+//
+// A nil slice with a nil error therefore means the claim set is genuinely
+// empty and nothing else. The boot path reads ErrClaimsUnavailable as
+// "claim nothing"; a caller sweeping records against the claim set reads it
+// as "do not act on state you cannot read".
+func ClaimedKernelABIs(rootdir string) ([]string, error) {
+	containers, err := readContainers(rootdir, HOSTOS_BLOCKS_CLASS)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// An absent data root means the partition is not mounted or the
+			// path is wrong; treating it as a fresh store would silently drop
+			// every deployed claim.
+			if _, statErr := os.Stat(rootdir); statErr != nil {
+				return nil, statErr
+			}
+			return nil, ErrClaimsUnavailable
+		}
+		return nil, err
+	}
+
+	seen := make(map[string]struct{}, len(containers))
+	var abis []string
+	for _, c := range containers {
+		abi := c.Labels[HOSTOS_BLOCKS_KERNEL_ABI_ID]
+		if abi == "" {
+			continue
+		}
+		if _, dup := seen[abi]; dup {
+			continue
+		}
+		seen[abi] = struct{}{}
+		abis = append(abis, abi)
+	}
+	sort.Strings(abis)
+	return abis, nil
+}
 
 // ParseHostKernelABIID extracts the balena_kernel_abi=<value> token from a
 // kernel cmdline string and returns its value. Returns "" when the token is
