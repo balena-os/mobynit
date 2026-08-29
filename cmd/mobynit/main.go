@@ -84,7 +84,6 @@ func unescapeMountpoint(s string) string {
 const (
 	HOSTAPP_LAYER_ROOT       = "balena"
 	PIVOT_PATH               = "/mnt/sysroot/active"
-	HOSTOS_BLOCKS_CLASS      = "io.balena.image.class"
 	LOG_DIR                  = "/tmp/initramfs/"
 	LOG_FILE                 = "initramfs.debug"
 	CMDLINE_DISABLE_OVERLAYS = "mobynit.no_overlays"
@@ -193,7 +192,7 @@ func mountDataOverlays(newRootPath string, baseLayers []string) error {
 		return nil
 	}
 
-	containers, err := hostapp.Mount(filepath.Join(newRootPath, string(os.PathSeparator), filepath.Join(DATA_DIR_NAME, string(os.PathSeparator), DATA_LAYER_ROOT)), HOSTOS_BLOCKS_CLASS)
+	containers, err := hostapp.Mount(filepath.Join(newRootPath, string(os.PathSeparator), filepath.Join(DATA_DIR_NAME, string(os.PathSeparator), DATA_LAYER_ROOT)), hostapp.HOSTOS_BLOCKS_CLASS)
 	if err != nil {
 		return err
 	}
@@ -311,8 +310,35 @@ func prepareForPivot() (string, error) {
 
 func main() {
 	sysrootPtr := flag.String("sysroot", "", "root of partition e.g. /mnt/sysroot/inactive. Mount destination is returned in stdout")
+	claimedPtr := flag.String("claimed-abis", "", "docker data root to report the kernel ABI ids claimed by deployed extensions for, one per line, then exit")
 	flag.StringVar(&dataFstype, "dataFstype", "ext4", "Filesystem type for the data partition. Defaults to ext4.")
 	flag.Parse()
+
+	// Bootloader initramfs query: mount nothing, write nothing, return early
+	claimedGiven := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "claimed-abis" {
+			claimedGiven = true
+		}
+	})
+	if claimedGiven {
+		if *claimedPtr == "" {
+			// Fail closed: a fall-through would pivot in the bootloader initramfs
+			log.Fatalln("-claimed-abis requires a docker data root path")
+		}
+		// A store this boot cannot read is a store it will not mount, so
+		// every error claims nothing and the caller boots the stock kernel.
+		// Exiting non-zero here would make kexec boot the armed override
+		// kernel with none of its modules.
+		abis, err := hostapp.ClaimedKernelABIs(*claimedPtr)
+		if err != nil {
+			log.Println("Claiming no kernel ABI:", err)
+		}
+		for _, abi := range abis {
+			fmt.Println(abi)
+		}
+		return
+	}
 
 	if sysrootPtr != nil && *sysrootPtr != "" {
 		var containers []hostapp.Container
