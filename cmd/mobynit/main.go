@@ -88,7 +88,7 @@ const (
 	LOG_DIR                  = "/tmp/initramfs/"
 	LOG_FILE                 = "initramfs.debug"
 	CMDLINE_DISABLE_OVERLAYS = "mobynit.no_overlays"
-	DATA_DIR_NAME            = "/mnt/data"
+	DATA_WORK_DIR            = "/tmp/mobynit-data"
 	DATA_STATE_NAME          = "resin-data"
 	DATA_LAYER_ROOT          = "docker"
 	PURGE_MARKER_FILE        = "remove_me_to_reset"
@@ -150,6 +150,10 @@ func shortenChain(farm *lowerdirFarm, name string, layers []string) []string {
 /* Filesystem type for data partition */
 var dataFstype string
 
+/* Where udev publishes the by-state partition symlinks. A variable so tests
+ * can point the data partition lookup at a fixture. */
+var stateDiskDir = "/dev/disk/by-state/"
+
 /* Hostapps contain a current symlink to the hostapp home directory
  * instead of being labelled. This allows for atomic hostapp updates
  * (just a rename on the symlink).
@@ -173,27 +177,43 @@ func mountSysroot(rootdir string) ([]hostapp.Container, error) {
 }
 
 func mountDataOverlays(newRootPath string, baseLayers []string) error {
-	device, err := os.Readlink(filepath.Join("/dev/disk/by-state/", DATA_STATE_NAME))
+	device, err := os.Readlink(filepath.Join(stateDiskDir, DATA_STATE_NAME))
 	if err != nil {
 		return fmt.Errorf("No udev by-state resin-data symbolic link")
 	}
 	// As the /dev mount was moved this cannot be used directly
 	device = filepath.Join("/dev", string(os.PathSeparator), path.Base(device))
-	dataMountPath := filepath.Join(newRootPath, string(os.PathSeparator), DATA_DIR_NAME)
-	err = unix.Mount(device, dataMountPath, dataFstype, 0, "")
-	if err != nil {
+
+	// This is mobynit's own working mount, needed only to read the extension
+	// layers under <data>/docker while the root is composed.
+	// It is deliberately outside newRootPath, because the composed overlay is
+	// stacked over newRootPath below and would shadow anything mounted beneath it.
+	if err := os.MkdirAll(DATA_WORK_DIR, 0755); err != nil {
+		return fmt.Errorf("Error creating %s: %v", DATA_WORK_DIR, err)
+	}
+	if err := unix.Mount(device, DATA_WORK_DIR, dataFstype, 0, ""); err != nil {
 		return fmt.Errorf("Error mounting data partition: %v", err)
 	}
+	// Detached rather than unmounted so that the release cannot fail on an
+	// error path that left an extension overlay mounted underneath. The
+	// composed root keeps working either way as it references the extension
+	// layers by dentry, which holds the superblock open once the mount is out
+	// of the namespace the booted system inherits.
+	defer func() {
+		if err := unix.Unmount(DATA_WORK_DIR, unix.MNT_DETACH); err != nil {
+			log.Printf("Warning: releasing data partition mount %s: %v", DATA_WORK_DIR, err)
+		}
+	}()
 
 	// Check for pending purge - if remove_me_to_reset is missing,
 	// data partition will be wiped after boot, so skip extension mounting
-	purgeMarker := filepath.Join(dataMountPath, PURGE_MARKER_FILE)
+	purgeMarker := filepath.Join(DATA_WORK_DIR, PURGE_MARKER_FILE)
 	if _, err := os.Stat(purgeMarker); os.IsNotExist(err) {
 		log.Println("Purge pending: remove_me_to_reset missing, skipping extension overlays")
 		return nil
 	}
 
-	containers, err := hostapp.Mount(filepath.Join(newRootPath, string(os.PathSeparator), filepath.Join(DATA_DIR_NAME, string(os.PathSeparator), DATA_LAYER_ROOT)), hostapp.HOSTOS_BLOCKS_CLASS)
+	containers, err := hostapp.Mount(filepath.Join(DATA_WORK_DIR, DATA_LAYER_ROOT), hostapp.HOSTOS_BLOCKS_CLASS)
 	if err != nil {
 		return err
 	}
