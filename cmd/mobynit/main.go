@@ -1,6 +1,6 @@
 /*
-	Mobynit can either mount a custom sysroot if specified on the command
-	line, or pivot root inside a default sysroot.
+Mobynit can either mount a custom sysroot if specified on the command
+line, or pivot root inside a default sysroot.
 */
 package main
 
@@ -89,8 +89,6 @@ const (
 	CMDLINE_DISABLE_OVERLAYS = "mobynit.no_overlays"
 	DATA_WORK_DIR            = "/tmp/mobynit-data"
 	DATA_STATE_NAME          = "resin-data"
-	DATA_LAYER_ROOT          = "docker"
-	PURGE_MARKER_FILE        = "remove_me_to_reset"
 )
 
 /* Do not overlay images */
@@ -197,15 +195,12 @@ func mountDataOverlays(newRootPath string, baseLayers []string) error {
 		}
 	}()
 
-	// Check for pending purge - if remove_me_to_reset is missing,
-	// data partition will be wiped after boot, so skip extension mounting
-	purgeMarker := filepath.Join(DATA_WORK_DIR, PURGE_MARKER_FILE)
-	if _, err := os.Stat(purgeMarker); os.IsNotExist(err) {
-		log.Println("Purge pending: remove_me_to_reset missing, skipping extension overlays")
+	if pending, err := hostapp.PurgePending(DATA_WORK_DIR); pending {
+		log.Printf("Purge pending: %s unreadable (%v), skipping extension overlays", hostapp.PURGE_MARKER_FILE, err)
 		return nil
 	}
 
-	containers, err := hostapp.Mount(filepath.Join(DATA_WORK_DIR, DATA_LAYER_ROOT), hostapp.HOSTOS_BLOCKS_CLASS)
+	containers, err := hostapp.Mount(filepath.Join(DATA_WORK_DIR, hostapp.DATA_LAYER_ROOT), hostapp.HOSTOS_BLOCKS_CLASS)
 	if err != nil {
 		return err
 	}
@@ -323,7 +318,7 @@ func prepareForPivot() (string, error) {
 
 func main() {
 	sysrootPtr := flag.String("sysroot", "", "root of partition e.g. /mnt/sysroot/inactive. Mount destination is returned in stdout")
-	claimedPtr := flag.String("claimed-abis", "", "docker data root to report the kernel ABI ids claimed by deployed extensions for, one per line, then exit")
+	claimedPtr := flag.String("claimed-abis", "", "docker data root to report the kernel ABI ids whose modules this boot will mount, one per line, then exit")
 	flag.StringVar(&dataFstype, "dataFstype", "ext4", "Filesystem type for the data partition. Defaults to ext4.")
 	flag.Parse()
 
