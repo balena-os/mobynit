@@ -1793,11 +1793,19 @@ type storeEntry struct {
 	removalInProgress bool
 }
 
-// writeStore lays out <root>/containers/<dir>/config.v2.json for each entry
-// and returns the docker data root, the argument readContainers takes.
+// writeStore lays out a data partition: the purge marker under <tmp>/data and
+// one config.v2.json per entry under <tmp>/data/docker/containers/<dir>.
+// It returns the docker data root.
 func writeStore(t *testing.T, entries ...storeEntry) string {
 	t.Helper()
-	root := t.TempDir()
+	data := t.TempDir()
+	if err := os.WriteFile(filepath.Join(data, PURGE_MARKER_FILE), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(data, DATA_LAYER_ROOT)
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
 	for _, e := range entries {
 		labels := map[string]interface{}{}
 		if e.class != "" {
@@ -1829,6 +1837,14 @@ func writeStore(t *testing.T, entries ...storeEntry) string {
 		}
 	}
 	return root
+}
+
+// armPurge deletes the purge marker, which arms a wipe of the partition.
+func armPurge(t *testing.T, root string) {
+	t.Helper()
+	if err := os.Remove(filepath.Join(filepath.Dir(root), PURGE_MARKER_FILE)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestReadContainers(t *testing.T) {
@@ -1940,6 +1956,71 @@ func TestClaimedKernelABIs(t *testing.T) {
 		}
 	})
 
+	// Unavailable, not empty: the claims exist but this boot mounts none
+	t.Run("a pending purge is unavailable", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "km", class: "overlay", abi: abiA})
+		armPurge(t, root)
+		got, err := ClaimedKernelABIs(root)
+		if !errors.Is(err, ErrClaimsUnavailable) {
+			t.Fatalf("got %v, want ErrClaimsUnavailable", err)
+		}
+		// The path is the only clue for a caller that points elsewhere
+		if !strings.Contains(err.Error(), PURGE_MARKER_FILE) {
+			t.Errorf("error must name the marker it looked for, got %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no claims", got)
+		}
+	})
+
+	// The decoy marker inside the store must not disarm the purge
+	t.Run("a pending purge outranks a readable store", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "km", class: "overlay", abi: abiA})
+		armPurge(t, root)
+		if err := os.WriteFile(filepath.Join(root, PURGE_MARKER_FILE), nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := ClaimedKernelABIs(root)
+		if !errors.Is(err, ErrClaimsUnavailable) {
+			t.Fatalf("got %v, want ErrClaimsUnavailable", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no claims", got)
+		}
+	})
+
+	// An unreadable marker says nothing about the purge state.
+	// A self-referential symlink fails the stat even for root.
+	t.Run("an unreadable marker is unavailable", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "km", class: "overlay", abi: abiA})
+		marker := filepath.Join(filepath.Dir(root), PURGE_MARKER_FILE)
+		if err := os.Remove(marker); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(PURGE_MARKER_FILE, marker); err != nil {
+			t.Fatal(err)
+		}
+		got, err := ClaimedKernelABIs(root)
+		if !errors.Is(err, ErrClaimsUnavailable) {
+			t.Fatalf("got %v, want ErrClaimsUnavailable", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no claims", got)
+		}
+	})
+
+	// filepath.Dir does not clean: Dir("<data>/docker/") is "<data>/docker"
+	t.Run("a trailing slash still finds the marker", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "km", class: "overlay", abi: abiA})
+		got, err := ClaimedKernelABIs(root + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, []string{abiA}) {
+			t.Errorf("got %v, want %v", got, []string{abiA})
+		}
+	})
+
 	// Orphaned override: the bootenv arm outlives the extension
 	t.Run("a removed extension claims nothing", func(t *testing.T) {
 		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "app"})
@@ -2006,7 +2087,7 @@ func TestClaimedKernelABIs(t *testing.T) {
 
 	// Unpopulated data root is unavailable, not an empty set.
 	t.Run("missing containers directory is unavailable", func(t *testing.T) {
-		got, err := ClaimedKernelABIs(t.TempDir())
+		got, err := ClaimedKernelABIs(writeStore(t))
 		if !errors.Is(err, ErrClaimsUnavailable) {
 			t.Fatalf("got %v, want ErrClaimsUnavailable", err)
 		}
@@ -2030,6 +2111,21 @@ func TestClaimedKernelABIs(t *testing.T) {
 		}
 	})
 
+	// A root one level off would read the wrong marker
+	t.Run("the data partition itself is unavailable", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "km", class: "overlay", abi: abiA})
+		got, err := ClaimedKernelABIs(filepath.Dir(root))
+		if !errors.Is(err, ErrClaimsUnavailable) {
+			t.Fatalf("got %v, want ErrClaimsUnavailable", err)
+		}
+		if !strings.Contains(err.Error(), DATA_LAYER_ROOT) {
+			t.Errorf("error must name what it expected, got %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no claims", got)
+		}
+	})
+
 	// An absent data root must not read as an empty store
 	t.Run("an absent data root is an error", func(t *testing.T) {
 		if _, err := ClaimedKernelABIs(filepath.Join(t.TempDir(), "absent")); err == nil {
@@ -2039,7 +2135,7 @@ func TestClaimedKernelABIs(t *testing.T) {
 
 	// "cannot tell" must stay distinct from "nothing claims it"
 	t.Run("an unreadable store is an error", func(t *testing.T) {
-		root := t.TempDir()
+		root := writeStore(t)
 		if err := os.WriteFile(filepath.Join(root, "containers"), []byte("not a directory"), 0644); err != nil {
 			t.Fatal(err)
 		}
@@ -2072,6 +2168,63 @@ func TestClaimedKernelABIs(t *testing.T) {
 		}
 		if after := treeSnapshot(t, root); !reflect.DeepEqual(before, after) {
 			t.Errorf("store changed during the query:\nbefore %v\nafter  %v", before, after)
+		}
+	})
+}
+
+func TestDataDirOf(t *testing.T) {
+	t.Run("strips the store directory", func(t *testing.T) {
+		got, err := dataDirOf("/mnt/data/docker")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "/mnt/data" {
+			t.Errorf("got %q, want %q", got, "/mnt/data")
+		}
+	})
+
+	// filepath.Dir does not clean: Dir("<data>/docker/") is "<data>/docker"
+	t.Run("a trailing slash strips one level", func(t *testing.T) {
+		got, err := dataDirOf("/mnt/data/docker/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "/mnt/data" {
+			t.Errorf("got %q, want %q", got, "/mnt/data")
+		}
+	})
+
+	// A root one level off would read the wrong marker
+	t.Run("the data partition itself is an error", func(t *testing.T) {
+		if _, err := dataDirOf("/mnt/data"); err == nil {
+			t.Fatal("expected an error for a path that is not a data root")
+		}
+	})
+}
+
+func TestPurgePending(t *testing.T) {
+	t.Run("a present marker disarms the purge", func(t *testing.T) {
+		data := t.TempDir()
+		if err := os.WriteFile(filepath.Join(data, PURGE_MARKER_FILE), nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+		pending, err := PurgePending(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pending {
+			t.Error("got pending, want disarmed")
+		}
+	})
+
+	t.Run("an absent marker arms the purge", func(t *testing.T) {
+		pending, err := PurgePending(t.TempDir())
+		if !pending {
+			t.Error("got disarmed, want pending")
+		}
+		// Callers log this error, so it must name the path
+		if err == nil || !strings.Contains(err.Error(), PURGE_MARKER_FILE) {
+			t.Errorf("error must name the marker it looked for, got %v", err)
 		}
 	})
 }

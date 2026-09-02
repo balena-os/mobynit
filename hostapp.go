@@ -257,11 +257,36 @@ const (
 	HOSTOS_BLOCKS_KERNEL_VERSION = "io.balena.image.kernel-version"
 	HOSTOS_BLOCKS_KERNEL_ABI_ID  = "io.balena.image.kernel-abi-id"
 	CMDLINE_KERNEL_ABI           = "balena_kernel_abi"
+	PURGE_MARKER_FILE            = "remove_me_to_reset"
+	// Container store directory inside the data partition
+	DATA_LAYER_ROOT = "docker"
 )
 
 // ErrClaimsUnavailable reports that the deployed kernel ABI claims cannot be
 // determined from the store.
 var ErrClaimsUnavailable = errors.New("cannot determine the deployed kernel ABI claims")
+
+// dataDirOf returns the data partition that holds a docker data root. The
+// store is DATA_LAYER_ROOT inside the partition. Any other base name means
+// the caller is one level off. The marker lookup would then read the wrong
+// directory.
+func dataDirOf(dockerRoot string) (string, error) {
+	clean := filepath.Clean(dockerRoot)
+	if filepath.Base(clean) != DATA_LAYER_ROOT {
+		return "", fmt.Errorf("%q is not a %s data root", dockerRoot, DATA_LAYER_ROOT)
+	}
+	return filepath.Dir(clean), nil
+}
+
+// PurgePending reports whether this boot wipes the data partition. An absent
+// PURGE_MARKER_FILE arms the purge. An unreadable one says nothing about the
+// state, so it counts as armed. The error names the marker path.
+func PurgePending(dataDir string) (bool, error) {
+	if _, err := os.Stat(filepath.Join(dataDir, PURGE_MARKER_FILE)); err != nil {
+		return true, err
+	}
+	return false, nil
+}
 
 // ClaimedKernelABIs returns the kernel ABI ids that deployed extensions
 // claim. It reads the container store directly, with no engine running.
@@ -269,9 +294,14 @@ var ErrClaimsUnavailable = errors.New("cannot determine the deployed kernel ABI 
 // A claim is not a promise that the boot mounts the modules: the pid 1 mount
 // path applies filters this query does not model.
 //
-// Three states, which callers read differently:
+// rootdir is the docker data root, <data>/docker. A caller that passes the
+// data partition itself gets ErrClaimsUnavailable, which names the store
+// directory it expected.
+//
+// Four states, which callers read differently:
 //
 //	data root absent                          the stat error
+//	purge armed, no remove_me_to_reset        ErrClaimsUnavailable
 //	containers directory missing              ErrClaimsUnavailable
 //	containers present, none claiming an ABI  nil, nil
 //
@@ -279,15 +309,24 @@ var ErrClaimsUnavailable = errors.New("cannot determine the deployed kernel ABI 
 // reads ErrClaimsUnavailable as "claim nothing". A record sweeper reads it as
 // "do not act on state you cannot read".
 func ClaimedKernelABIs(rootdir string) ([]string, error) {
+	if _, err := os.Stat(rootdir); err != nil {
+		return nil, err
+	}
+
+	dataDir, err := dataDirOf(rootdir)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrClaimsUnavailable, err)
+	}
+
+	// A purge boot mounts no extension, so the deployed claims would select a
+	// kernel whose modules stay unmounted.
+	if pending, err := PurgePending(dataDir); pending {
+		return nil, fmt.Errorf("%w: %v", ErrClaimsUnavailable, err)
+	}
+
 	containers, err := readContainers(rootdir, HOSTOS_BLOCKS_CLASS)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			// An absent data root means the partition is not mounted or the
-			// path is wrong; treating it as a fresh store would silently drop
-			// every deployed claim.
-			if _, statErr := os.Stat(rootdir); statErr != nil {
-				return nil, statErr
-			}
 			return nil, fmt.Errorf("%w: %v", ErrClaimsUnavailable, err)
 		}
 		return nil, err

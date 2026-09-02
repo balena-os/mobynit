@@ -62,9 +62,15 @@ Exit codes are the contract:
 | 0, no output | no deployed extension claims an ABI |
 | non-zero | this binary cannot answer: the argument is empty, or the binary predates the flag |
 
+Two states reach the empty answer. It is the correct answer in both.
+
 A store that mobynit cannot read claims nothing. The query and the pid 1 mount
 path read the same store with the same code. A store that fails to read now
 also fails at pid 1. That boot mounts no modules.
+
+A pending purge claims nothing. The data partition is wiped after boot, so
+mobynit skips every extension overlay on it. The deployed claims would select
+a kernel whose modules that boot never mounts.
 
 ### Overlay mount ordering
 
