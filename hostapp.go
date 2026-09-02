@@ -258,19 +258,21 @@ const (
 	HOSTOS_BLOCKS_KERNEL_VERSION = "io.balena.image.kernel-version"
 	HOSTOS_BLOCKS_KERNEL_ABI_ID  = "io.balena.image.kernel-abi-id"
 	CMDLINE_KERNEL_ABI           = "balena_kernel_abi"
+	PURGE_MARKER_FILE            = "remove_me_to_reset"
 )
 
 // ErrClaimsUnavailable reports that the deployed kernel ABI claims cannot be
 // determined from the store.
 var ErrClaimsUnavailable = errors.New("cannot determine the deployed kernel ABI claims")
 
-// ClaimedKernelABIs returns the kernel ABI ids claimed by the OS block
-// containers in the store, read straight from the container store with no
-// engine running.
+// ClaimedKernelABIs returns the kernel ABI ids mobynit will mount module trees
+// for on this boot, read straight from the container store with no engine
+// running.
 //
-// Three states, which callers read differently:
+// Four states, which callers read differently:
 //
 //	data root absent                          the stat error
+//	purge armed, no remove_me_to_reset        ErrClaimsUnavailable
 //	containers directory missing              ErrClaimsUnavailable
 //	containers present, none claiming an ABI  nil, nil
 //
@@ -279,15 +281,25 @@ var ErrClaimsUnavailable = errors.New("cannot determine the deployed kernel ABI 
 // "claim nothing"; a caller sweeping records against the claim set reads it
 // as "do not act on state you cannot read".
 func ClaimedKernelABIs(rootdir string) ([]string, error) {
+	// An absent data root means the partition is not mounted or the path is
+	// wrong.
+	if _, err := os.Stat(rootdir); err != nil {
+		return nil, err
+	}
+
+	// A purge boot wipes the data partition, and mountDataOverlays skips every
+	// extension overlay because of it. Answering with the deployed claims would
+	// let the caller select a kernel whose modules this boot leaves unmounted.
+	// The store is <data>/docker, so the marker is one level up. An unreadable
+	// marker is not proof that the purge is disarmed.
+	marker := filepath.Join(filepath.Dir(filepath.Clean(rootdir)), PURGE_MARKER_FILE)
+	if _, err := os.Stat(marker); err != nil {
+		return nil, ErrClaimsUnavailable
+	}
+
 	containers, err := readContainers(rootdir, HOSTOS_BLOCKS_CLASS)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			// An absent data root means the partition is not mounted or the
-			// path is wrong; treating it as a fresh store would silently drop
-			// every deployed claim.
-			if _, statErr := os.Stat(rootdir); statErr != nil {
-				return nil, statErr
-			}
 			return nil, ErrClaimsUnavailable
 		}
 		return nil, err

@@ -1793,11 +1793,20 @@ type storeEntry struct {
 	removalInProgress bool
 }
 
-// writeStore lays out <root>/containers/<dir>/config.v2.json for each entry
-// and returns the docker data root, the argument readContainers takes.
+// writeStore lays out a data partition: <tmp>/data holds the purge marker that
+// says no purge is armed, and <tmp>/data/docker/containers/<dir>/config.v2.json
+// holds each entry. Returns the docker data root, the argument readContainers
+// takes.
 func writeStore(t *testing.T, entries ...storeEntry) string {
 	t.Helper()
-	root := t.TempDir()
+	data := t.TempDir()
+	if err := os.WriteFile(filepath.Join(data, PURGE_MARKER_FILE), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(data, "docker")
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
 	for _, e := range entries {
 		labels := map[string]interface{}{}
 		if e.class != "" {
@@ -1829,6 +1838,15 @@ func writeStore(t *testing.T, entries ...storeEntry) string {
 		}
 	}
 	return root
+}
+
+// armPurge deletes the purge marker from the data partition holding the store,
+// which is how a reset is armed: the next boot wipes the partition.
+func armPurge(t *testing.T, root string) {
+	t.Helper()
+	if err := os.Remove(filepath.Join(filepath.Dir(root), PURGE_MARKER_FILE)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestReadContainers(t *testing.T) {
@@ -1942,6 +1960,79 @@ func TestClaimedKernelABIs(t *testing.T) {
 		}
 	})
 
+	// A purge boot wipes the data partition, so mountDataOverlays skips every
+	// extension overlay on it. Reporting the deployed claims here would let the
+	// bootloader select a kernel whose module tree this boot is not going to
+	// mount, which is what strands the device on a purge.
+	// Unavailable, not empty: the claims exist but go unmounted.
+	t.Run("a pending purge is unavailable", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "km", class: "overlay", abi: abiA})
+		armPurge(t, root)
+		got, err := ClaimedKernelABIs(root)
+		if !errors.Is(err, ErrClaimsUnavailable) {
+			t.Fatalf("got %v, want ErrClaimsUnavailable", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no claims", got)
+		}
+	})
+
+	// The marker is read on the data partition, not inside the store. The decoy
+	// copy at <data>/docker/remove_me_to_reset is what makes that concrete: an
+	// implementation that looked the marker up at rootdir would find it, read
+	// the purge as not armed, and report an ABI whose modules this boot leaves
+	// unmounted.
+	t.Run("a pending purge outranks a readable store", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "km", class: "overlay", abi: abiA})
+		armPurge(t, root)
+		if err := os.WriteFile(filepath.Join(root, PURGE_MARKER_FILE), nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := ClaimedKernelABIs(root)
+		if !errors.Is(err, ErrClaimsUnavailable) {
+			t.Fatalf("got %v, want ErrClaimsUnavailable", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no claims", got)
+		}
+	})
+
+	// A stat that fails for any other reason says nothing about whether the
+	// purge is armed, and reporting the deployed claims on a guess is what
+	// strands the device. A self-referential symlink makes the stat fail with
+	// ELOOP even for root, which chmod cannot do.
+	t.Run("an unreadable marker is unavailable", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "km", class: "overlay", abi: abiA})
+		marker := filepath.Join(filepath.Dir(root), PURGE_MARKER_FILE)
+		if err := os.Remove(marker); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(PURGE_MARKER_FILE, marker); err != nil {
+			t.Fatal(err)
+		}
+		got, err := ClaimedKernelABIs(root)
+		if !errors.Is(err, ErrClaimsUnavailable) {
+			t.Fatalf("got %v, want ErrClaimsUnavailable", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %v, want no claims", got)
+		}
+	})
+
+	// filepath.Dir does not clean its argument: Dir("<data>/docker/") is
+	// "<data>/docker", which looks the marker up inside the store and reads
+	// every boot as a pending purge.
+	t.Run("a trailing slash still finds the marker", func(t *testing.T) {
+		root := writeStore(t, storeEntry{dir: "01", id: "aaa1", name: "km", class: "overlay", abi: abiA})
+		got, err := ClaimedKernelABIs(root + "/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, []string{abiA}) {
+			t.Errorf("got %v, want %v", got, []string{abiA})
+		}
+	})
+
 	// The orphaned-override case: the arm survives in the bootenv, but nothing
 	// in the store claims it any more.
 	t.Run("a removed extension claims nothing", func(t *testing.T) {
@@ -2011,7 +2102,7 @@ func TestClaimedKernelABIs(t *testing.T) {
 
 	// Unpopulated data root is unavailable, not an empty set.
 	t.Run("missing containers directory is unavailable", func(t *testing.T) {
-		got, err := ClaimedKernelABIs(t.TempDir())
+		got, err := ClaimedKernelABIs(writeStore(t))
 		if !errors.Is(err, ErrClaimsUnavailable) {
 			t.Fatalf("got %v, want ErrClaimsUnavailable", err)
 		}
@@ -2047,7 +2138,7 @@ func TestClaimedKernelABIs(t *testing.T) {
 	// caller boots the override on the first and falls back to stock on the
 	// second.
 	t.Run("an unreadable store is an error", func(t *testing.T) {
-		root := t.TempDir()
+		root := writeStore(t)
 		if err := os.WriteFile(filepath.Join(root, "containers"), []byte("not a directory"), 0644); err != nil {
 			t.Fatal(err)
 		}
