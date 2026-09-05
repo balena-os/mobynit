@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -38,7 +39,7 @@ type Container struct {
 	Config
 	MountPath string
 	HomePath  string
-	Layers []string
+	Layers    []string
 }
 
 var (
@@ -173,15 +174,18 @@ func (container *Container) initialize(homePath string) error {
 	return nil
 }
 
-// initializeContainers finds and mounts containers
-func initializeContainers(rootdir string, match string) ([]Container, error) {
+// readContainers returns the container records under rootdir matching match,
+// without mounting anything. Dead and removal-in-progress containers are
+// dropped here because they contribute nothing to a boot; every caller must
+// see the same set the mount path does, so this exclusion has a single home.
+func readContainers(rootdir string, match string) ([]Container, error) {
 	containersDir := filepath.Join(rootdir, "containers")
 	entries, err := os.ReadDir(containersDir)
 	if err != nil {
 		return nil, fmt.Errorf("reading containers directory: %w", err)
 	}
 
-	var mountedContainers []Container
+	var found []Container
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -214,11 +218,27 @@ func initializeContainers(rootdir string, match string) ([]Container, error) {
 			continue
 		}
 
-		if _, err := container.mount(rootdir); err != nil {
+		found = append(found, container)
+	}
+
+	return found, nil
+}
+
+// initializeContainers finds and mounts containers
+func initializeContainers(rootdir string, match string) ([]Container, error) {
+	containers, err := readContainers(rootdir, match)
+	if err != nil {
+		return nil, err
+	}
+
+	var mountedContainers []Container
+
+	for i := range containers {
+		if _, err := containers[i].mount(rootdir); err != nil {
 			log.Println("Failed to mount container:", err)
-		} else {
-			mountedContainers = append(mountedContainers, container)
+			continue
 		}
+		mountedContainers = append(mountedContainers, containers[i])
 	}
 
 	return mountedContainers, nil
@@ -233,11 +253,74 @@ func Mount(rootdir string, label string) ([]Container, error) {
 }
 
 const (
+	HOSTOS_BLOCKS_CLASS          = "io.balena.image.class"
 	HOSTOS_BLOCKS_OVERRIDE       = "io.balena.image.override"
 	HOSTOS_BLOCKS_KERNEL_VERSION = "io.balena.image.kernel-version"
 	HOSTOS_BLOCKS_KERNEL_ABI_ID  = "io.balena.image.kernel-abi-id"
 	CMDLINE_KERNEL_ABI           = "balena_kernel_abi"
+	PURGE_MARKER_FILE            = "remove_me_to_reset"
 )
+
+// ErrClaimsUnavailable reports that the deployed kernel ABI claims cannot be
+// determined from the store.
+var ErrClaimsUnavailable = errors.New("cannot determine the deployed kernel ABI claims")
+
+// ClaimedKernelABIs returns the kernel ABI ids mobynit will mount module trees
+// for on this boot, read straight from the container store with no engine
+// running.
+//
+// Four states, which callers read differently:
+//
+//	data root absent                          the stat error
+//	purge armed, no remove_me_to_reset        ErrClaimsUnavailable
+//	containers directory missing              ErrClaimsUnavailable
+//	containers present, none claiming an ABI  nil, nil
+//
+// A nil slice with a nil error therefore means the claim set is genuinely
+// empty and nothing else. The boot path reads ErrClaimsUnavailable as
+// "claim nothing"; a caller sweeping records against the claim set reads it
+// as "do not act on state you cannot read".
+func ClaimedKernelABIs(rootdir string) ([]string, error) {
+	// An absent data root means the partition is not mounted or the path is
+	// wrong.
+	if _, err := os.Stat(rootdir); err != nil {
+		return nil, err
+	}
+
+	// A purge boot wipes the data partition, and mountDataOverlays skips every
+	// extension overlay because of it. Answering with the deployed claims would
+	// let the caller select a kernel whose modules this boot leaves unmounted.
+	// The store is <data>/docker, so the marker is one level up. An unreadable
+	// marker is not proof that the purge is disarmed.
+	marker := filepath.Join(filepath.Dir(filepath.Clean(rootdir)), PURGE_MARKER_FILE)
+	if _, err := os.Stat(marker); err != nil {
+		return nil, ErrClaimsUnavailable
+	}
+
+	containers, err := readContainers(rootdir, HOSTOS_BLOCKS_CLASS)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrClaimsUnavailable
+		}
+		return nil, err
+	}
+
+	seen := make(map[string]struct{}, len(containers))
+	var abis []string
+	for _, c := range containers {
+		abi := c.Labels[HOSTOS_BLOCKS_KERNEL_ABI_ID]
+		if abi == "" {
+			continue
+		}
+		if _, dup := seen[abi]; dup {
+			continue
+		}
+		seen[abi] = struct{}{}
+		abis = append(abis, abi)
+	}
+	sort.Strings(abis)
+	return abis, nil
+}
 
 // ParseHostKernelABIID extracts the balena_kernel_abi=<value> token from a
 // kernel cmdline string and returns its value. Returns "" when the token is
@@ -306,10 +389,45 @@ func ComputeABIID(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// KernelImageForABIID returns the path of the regular file directly under
+// bootDir whose sha256 equals abi, or "" when the directory holds no match.
+// Only an unusable bootDir is an error, wrapping os.ErrNotExist when it is
+// absent, so callers can tell "nothing matches" from "cannot tell".
+//
+// Files that cannot be hashed are skipped, and the reasons returned for the
+// caller to report with whatever context it has.
+func KernelImageForABIID(bootDir, abi string) (string, []error, error) {
+	if abi == "" {
+		return "", nil, fmt.Errorf("no kernel ABI id to match against under %s", bootDir)
+	}
+	entries, err := os.ReadDir(bootDir)
+	if err != nil {
+		return "", nil, fmt.Errorf("reading %s: %w", bootDir, err)
+	}
+	var skipped []error
+	for _, e := range entries {
+		// A symlink's bytes could live outside the extension
+		if !e.Type().IsRegular() {
+			continue
+		}
+		image := filepath.Join(bootDir, e.Name())
+		id, err := ComputeABIID(image)
+		if err != nil {
+			// An unreadable file must not mask a later match
+			skipped = append(skipped, err)
+			continue
+		}
+		if id == abi {
+			return image, skipped, nil
+		}
+	}
+	return "", skipped, nil
+}
+
 // ResolveExtensionABIID returns the extension's kernel identity claim.
-// * The extension carries a modules tree
-// * A file directly under the extension's /boot (the shipped kernel image)
-//   hashes to hostABIID, the balena_kernel_abi cmdline token.
+//   - The extension carries a modules tree
+//   - A file directly under the extension's /boot (the shipped kernel image)
+//     hashes to hostABIID, the balena_kernel_abi cmdline token.
 //
 // Returns "" (no claim) when:
 // * The extension is unmounted
@@ -356,31 +474,21 @@ func (c *Container) ResolveExtensionABIID(release, hostABIID string) (string, er
 	}
 
 	bootDir := filepath.Join(c.MountPath, "boot")
-	entries, err := os.ReadDir(bootDir)
+	image, skipped, err := KernelImageForABIID(bootDir, hostABIID)
+	for _, s := range skipped {
+		log.Printf("Warning: extension %s: %v", c.Name, s)
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
+		// os.IsNotExist does not unwrap
+		if errors.Is(err, os.ErrNotExist) {
 			return "", fmt.Errorf("broken extension %s: modules present but no kernel image under /boot", c.Name)
 		}
-		return "", fmt.Errorf("broken extension %s: reading %s: %w", c.Name, bootDir, err)
+		return "", fmt.Errorf("broken extension %s: %w", c.Name, err)
 	}
-	for _, e := range entries {
-		// Regular files only: following a symlink would let the bytes we
-		// verify live outside the extension being verified.
-		if !e.Type().IsRegular() {
-			continue
-		}
-		id, err := ComputeABIID(filepath.Join(bootDir, e.Name()))
-		if err != nil {
-			// One unreadable file must not mask a valid match elsewhere
-			// under /boot; a genuine no-match still fails below.
-			log.Printf("Warning: extension %s: skipping unreadable /boot file: %v", c.Name, err)
-			continue
-		}
-		if id == hostABIID {
-			return id, nil
-		}
+	if image == "" {
+		return "", fmt.Errorf("extension %s: no /boot kernel image matches running kernel %q", c.Name, hostABIID)
 	}
-	return "", fmt.Errorf("extension %s: no /boot kernel image matches running kernel %q", c.Name, hostABIID)
+	return hostABIID, nil
 }
 
 // FilterByKernelABIID keeps only those containers safe to mount over the

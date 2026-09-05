@@ -1,11 +1,12 @@
 /*
-	Mobynit can either mount a custom sysroot if specified on the command
-	line, or pivot root inside a default sysroot.
+Mobynit can either mount a custom sysroot if specified on the command
+line, or pivot root inside a default sysroot.
 */
 package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -84,14 +85,12 @@ func unescapeMountpoint(s string) string {
 const (
 	HOSTAPP_LAYER_ROOT       = "balena"
 	PIVOT_PATH               = "/mnt/sysroot/active"
-	HOSTOS_BLOCKS_CLASS      = "io.balena.image.class"
 	LOG_DIR                  = "/tmp/initramfs/"
 	LOG_FILE                 = "initramfs.debug"
 	CMDLINE_DISABLE_OVERLAYS = "mobynit.no_overlays"
-	DATA_DIR_NAME            = "/mnt/data"
+	DATA_WORK_DIR            = "/tmp/mobynit-data"
 	DATA_STATE_NAME          = "resin-data"
 	DATA_LAYER_ROOT          = "docker"
-	PURGE_MARKER_FILE        = "remove_me_to_reset"
 )
 
 /* Do not overlay images */
@@ -150,6 +149,10 @@ func shortenChain(farm *lowerdirFarm, name string, layers []string) []string {
 /* Filesystem type for data partition */
 var dataFstype string
 
+/* Where udev publishes the by-state partition symlinks. A variable so tests
+ * can point the data partition lookup at a fixture. */
+var stateDiskDir = "/dev/disk/by-state/"
+
 /* Hostapps contain a current symlink to the hostapp home directory
  * instead of being labelled. This allows for atomic hostapp updates
  * (just a rename on the symlink).
@@ -173,27 +176,44 @@ func mountSysroot(rootdir string) ([]hostapp.Container, error) {
 }
 
 func mountDataOverlays(newRootPath string, baseLayers []string) error {
-	device, err := os.Readlink(filepath.Join("/dev/disk/by-state/", DATA_STATE_NAME))
+	device, err := os.Readlink(filepath.Join(stateDiskDir, DATA_STATE_NAME))
 	if err != nil {
 		return fmt.Errorf("No udev by-state resin-data symbolic link")
 	}
 	// As the /dev mount was moved this cannot be used directly
 	device = filepath.Join("/dev", string(os.PathSeparator), path.Base(device))
-	dataMountPath := filepath.Join(newRootPath, string(os.PathSeparator), DATA_DIR_NAME)
-	err = unix.Mount(device, dataMountPath, dataFstype, 0, "")
-	if err != nil {
+
+	// This is mobynit's own working mount, needed only to read the extension
+	// layers under <data>/docker while the root is composed.
+	// It is deliberately outside newRootPath, because the composed overlay is
+	// stacked over newRootPath below and would shadow anything mounted beneath it.
+	if err := os.MkdirAll(DATA_WORK_DIR, 0755); err != nil {
+		return fmt.Errorf("Error creating %s: %v", DATA_WORK_DIR, err)
+	}
+	if err := unix.Mount(device, DATA_WORK_DIR, dataFstype, 0, ""); err != nil {
 		return fmt.Errorf("Error mounting data partition: %v", err)
 	}
+	// Detached rather than unmounted so that the release cannot fail on an
+	// error path that left an extension overlay mounted underneath. The
+	// composed root keeps working either way as it references the extension
+	// layers by dentry, which holds the superblock open once the mount is out
+	// of the namespace the booted system inherits.
+	defer func() {
+		if err := unix.Unmount(DATA_WORK_DIR, unix.MNT_DETACH); err != nil {
+			log.Printf("Warning: releasing data partition mount %s: %v", DATA_WORK_DIR, err)
+		}
+	}()
 
 	// Check for pending purge - if remove_me_to_reset is missing,
-	// data partition will be wiped after boot, so skip extension mounting
-	purgeMarker := filepath.Join(dataMountPath, PURGE_MARKER_FILE)
-	if _, err := os.Stat(purgeMarker); os.IsNotExist(err) {
-		log.Println("Purge pending: remove_me_to_reset missing, skipping extension overlays")
+	// data partition will be wiped after boot, so skip extension mounting. An
+	// unreadable marker is not proof that the purge is disarmed.
+	purgeMarker := filepath.Join(DATA_WORK_DIR, hostapp.PURGE_MARKER_FILE)
+	if _, err := os.Stat(purgeMarker); err != nil {
+		log.Printf("Purge pending: %s unreadable (%v), skipping extension overlays", hostapp.PURGE_MARKER_FILE, err)
 		return nil
 	}
 
-	containers, err := hostapp.Mount(filepath.Join(newRootPath, string(os.PathSeparator), filepath.Join(DATA_DIR_NAME, string(os.PathSeparator), DATA_LAYER_ROOT)), HOSTOS_BLOCKS_CLASS)
+	containers, err := hostapp.Mount(filepath.Join(DATA_WORK_DIR, DATA_LAYER_ROOT), hostapp.HOSTOS_BLOCKS_CLASS)
 	if err != nil {
 		return err
 	}
@@ -311,8 +331,36 @@ func prepareForPivot() (string, error) {
 
 func main() {
 	sysrootPtr := flag.String("sysroot", "", "root of partition e.g. /mnt/sysroot/inactive. Mount destination is returned in stdout")
+	claimedPtr := flag.String("claimed-abis", "", "docker data root to report the kernel ABI ids whose modules this boot will mount, one per line, then exit")
 	flag.StringVar(&dataFstype, "dataFstype", "ext4", "Filesystem type for the data partition. Defaults to ext4.")
 	flag.Parse()
+
+	// A read-only query, run from the bootloader initramfs before the kexec.
+	// It must mount nothing and write nothing, so it returns ahead of the log
+	// directory setup and of everything that reads /proc/cmdline. A flag given
+	// with an empty value (a botched shell variable in the bootloader script)
+	// must fail closed here rather than fall through into the pid-1 boot
+	// sequence, which would mount and pivot inside the bootloader initramfs.
+	claimedGiven := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "claimed-abis" {
+			claimedGiven = true
+		}
+	})
+	if claimedGiven {
+		if *claimedPtr == "" {
+			log.Fatalln("-claimed-abis requires a docker data root path")
+		}
+		abis, err := hostapp.ClaimedKernelABIs(*claimedPtr)
+		// Cannot tell means claim nothing, as kexec expects
+		if err != nil && !errors.Is(err, hostapp.ErrClaimsUnavailable) {
+			log.Fatalln("Error reading claimed kernel ABIs:", err)
+		}
+		for _, abi := range abis {
+			fmt.Println(abi)
+		}
+		return
+	}
 
 	if sysrootPtr != nil && *sysrootPtr != "" {
 		var containers []hostapp.Container
