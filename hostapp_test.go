@@ -1494,7 +1494,7 @@ func TestFlatComposeDepthBudget(t *testing.T) {
 	unix.Unmount(seal, unix.MNT_DETACH)
 
 	// Compose the two merged views (each an overlay) into a depth-2 root so
-        // the sealing overlay on top then needs depth 3 and must be rejected.
+	// the sealing overlay on top then needs depth 3 and must be rejected.
 	baseMerged := tdir("base-merged")
 	if err := unix.Mount("overlay", baseMerged, "overlay", 0, "lowerdir="+strings.Join(baseLayers, ":")); err != nil {
 		t.Fatalf("base merged mount: %v", err)
@@ -2248,4 +2248,105 @@ func treeSnapshot(t *testing.T, root string) map[string]int64 {
 		t.Fatalf("walking %s: %v", root, err)
 	}
 	return out
+}
+
+func TestKernelImageForABIID_MatchesARegularFile(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte("kernel bytes")
+	sum := sha256.Sum256(content)
+	abi := hex.EncodeToString(sum[:])
+	if err := os.WriteFile(filepath.Join(dir, "Image"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.txt"), []byte("noise"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, skipped, err := KernelImageForABIID(dir, abi)
+	if err != nil {
+		t.Fatalf("KernelImageForABIID: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Errorf("nothing was unreadable, got %v", skipped)
+	}
+	if want := filepath.Join(dir, "Image"); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// The verified bytes must live inside the verified directory
+func TestKernelImageForABIID_SkipsSymlinks(t *testing.T) {
+	outside := t.TempDir()
+	content := []byte("kernel bytes")
+	sum := sha256.Sum256(content)
+	abi := hex.EncodeToString(sum[:])
+	real := filepath.Join(outside, "Image")
+	if err := os.WriteFile(real, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	if err := os.Symlink(real, filepath.Join(dir, "Image")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _, err := KernelImageForABIID(dir, abi)
+	if err != nil {
+		t.Fatalf("KernelImageForABIID: %v", err)
+	}
+	if got != "" {
+		t.Errorf("got %q, want no match", got)
+	}
+}
+
+func TestKernelImageForABIID_NoMatchIsNotAnError(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Image"), []byte("other"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _, err := KernelImageForABIID(dir, strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatalf("KernelImageForABIID: %v", err)
+	}
+	if got != "" {
+		t.Errorf("got %q, want no match", got)
+	}
+}
+
+// ResolveExtensionABIID reports an absent directory and no match differently
+func TestKernelImageForABIID_AbsentDirectoryIsNotExist(t *testing.T) {
+	_, _, err := KernelImageForABIID(filepath.Join(t.TempDir(), "boot"), strings.Repeat("a", 64))
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("got %v, want an os.ErrNotExist", err)
+	}
+}
+
+func TestKernelImageForABIID_EmptyABIIsAnError(t *testing.T) {
+	if _, _, err := KernelImageForABIID(t.TempDir(), ""); err == nil {
+		t.Fatal("an empty ABI must not match anything")
+	}
+}
+
+// Pins the accepted order: budget check before dedup.
+func TestBuildOverlayOptionsBudgetIsTestedBeforeDedup(t *testing.T) {
+	// Base fits one page; base twice does not.
+	pageLimit := os.Getpagesize() - 1
+	var base []string
+	for len(strings.Join(base, ":")) < pageLimit/2+16 {
+		base = append(base, fmt.Sprintf("/l%03d", len(base)))
+	}
+
+	shared := Extension{Layers: base, Name: "shares-the-whole-base"}
+	opts := BuildOverlayOptions(base, nil, []Extension{shared})
+
+	deduped := "lowerdir=" + strings.Join(base, ":")
+	if len(deduped) >= pageLimit {
+		t.Fatalf("test fixture is wrong: the deduplicated string must fit, got %d >= %d",
+			len(deduped), pageLimit)
+	}
+	if opts != deduped {
+		t.Errorf("expected the shared extension to be dropped before dedup could rescue it\n got %q\nwant %q",
+			opts, deduped)
+	}
 }
