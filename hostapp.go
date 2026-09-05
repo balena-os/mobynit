@@ -39,7 +39,7 @@ type Container struct {
 	Config
 	MountPath string
 	HomePath  string
-	Layers []string
+	Layers    []string
 }
 
 var (
@@ -389,10 +389,45 @@ func ComputeABIID(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// KernelImageForABIID returns the path of the regular file directly under
+// bootDir whose sha256 equals abi, or "" when the directory holds no match.
+// Only an unusable bootDir is an error, wrapping os.ErrNotExist when it is
+// absent, so callers can tell "nothing matches" from "cannot tell".
+//
+// Files that cannot be hashed are skipped, and the reasons returned for the
+// caller to report with whatever context it has.
+func KernelImageForABIID(bootDir, abi string) (string, []error, error) {
+	if abi == "" {
+		return "", nil, fmt.Errorf("no kernel ABI id to match against under %s", bootDir)
+	}
+	entries, err := os.ReadDir(bootDir)
+	if err != nil {
+		return "", nil, fmt.Errorf("reading %s: %w", bootDir, err)
+	}
+	var skipped []error
+	for _, e := range entries {
+		// A symlink's bytes could live outside the extension
+		if !e.Type().IsRegular() {
+			continue
+		}
+		image := filepath.Join(bootDir, e.Name())
+		id, err := ComputeABIID(image)
+		if err != nil {
+			// An unreadable file must not mask a later match
+			skipped = append(skipped, err)
+			continue
+		}
+		if id == abi {
+			return image, skipped, nil
+		}
+	}
+	return "", skipped, nil
+}
+
 // ResolveExtensionABIID returns the extension's kernel identity claim.
-// * The extension carries a modules tree
-// * A file directly under the extension's /boot (the shipped kernel image)
-//   hashes to hostABIID, the balena_kernel_abi cmdline token.
+//   - The extension carries a modules tree
+//   - A file directly under the extension's /boot (the shipped kernel image)
+//     hashes to hostABIID, the balena_kernel_abi cmdline token.
 //
 // Returns "" (no claim) when:
 // * The extension is unmounted
@@ -439,31 +474,21 @@ func (c *Container) ResolveExtensionABIID(release, hostABIID string) (string, er
 	}
 
 	bootDir := filepath.Join(c.MountPath, "boot")
-	entries, err := os.ReadDir(bootDir)
+	image, skipped, err := KernelImageForABIID(bootDir, hostABIID)
+	for _, s := range skipped {
+		log.Printf("Warning: extension %s: %v", c.Name, s)
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
+		// os.IsNotExist does not unwrap
+		if errors.Is(err, os.ErrNotExist) {
 			return "", fmt.Errorf("broken extension %s: modules present but no kernel image under /boot", c.Name)
 		}
-		return "", fmt.Errorf("broken extension %s: reading %s: %w", c.Name, bootDir, err)
+		return "", fmt.Errorf("broken extension %s: %w", c.Name, err)
 	}
-	for _, e := range entries {
-		// Regular files only: following a symlink would let the bytes we
-		// verify live outside the extension being verified.
-		if !e.Type().IsRegular() {
-			continue
-		}
-		id, err := ComputeABIID(filepath.Join(bootDir, e.Name()))
-		if err != nil {
-			// One unreadable file must not mask a valid match elsewhere
-			// under /boot; a genuine no-match still fails below.
-			log.Printf("Warning: extension %s: skipping unreadable /boot file: %v", c.Name, err)
-			continue
-		}
-		if id == hostABIID {
-			return id, nil
-		}
+	if image == "" {
+		return "", fmt.Errorf("extension %s: no /boot kernel image matches running kernel %q", c.Name, hostABIID)
 	}
-	return "", fmt.Errorf("extension %s: no /boot kernel image matches running kernel %q", c.Name, hostABIID)
+	return hostABIID, nil
 }
 
 // FilterByKernelABIID keeps only those containers safe to mount over the
