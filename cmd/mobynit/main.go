@@ -363,8 +363,8 @@ func main() {
 		lf, err := os.OpenFile(filepath.Join(LOG_DIR, LOG_FILE), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 		if err == nil {
 			defer lf.Close()
+			log.SetOutput(lf)
 		}
-		log.SetOutput(lf)
 		log.SetPrefix("[init][INFO] ")
 		// Omit timestamps as devices without RTC will see epoch
 		log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
