@@ -2323,8 +2323,8 @@ func TestKernelImageForABIID_EmptyABIIsAnError(t *testing.T) {
 	}
 }
 
-// Pins the accepted order: budget check before dedup.
-func TestBuildOverlayOptionsBudgetIsTestedBeforeDedup(t *testing.T) {
+// The budget measures the deduplicated string, the one the kernel receives.
+func TestBuildOverlayOptionsBudgetCountsSharedLayersOnce(t *testing.T) {
 	// Base fits one page; base twice does not.
 	pageLimit := os.Getpagesize() - 1
 	var base []string
@@ -2332,16 +2332,21 @@ func TestBuildOverlayOptionsBudgetIsTestedBeforeDedup(t *testing.T) {
 		base = append(base, fmt.Sprintf("/l%03d", len(base)))
 	}
 
-	shared := Extension{Layers: base, Name: "shares-the-whole-base"}
-	opts := BuildOverlayOptions(base, nil, []Extension{shared})
+	const own = "/own"
+	shared := Extension{Layers: append(append([]string{}, base...), own), Name: "shares-the-whole-base"}
 
-	deduped := "lowerdir=" + strings.Join(base, ":")
-	if len(deduped) >= pageLimit {
-		t.Fatalf("test fixture is wrong: the deduplicated string must fit, got %d >= %d",
-			len(deduped), pageLimit)
+	raw := "lowerdir=" + strings.Join(base, ":") + ":" + strings.Join(shared.Layers, ":")
+	if len(raw) < pageLimit {
+		t.Fatalf("test fixture is wrong: the raw string must not fit, got %d < %d", len(raw), pageLimit)
 	}
-	if opts != deduped {
-		t.Errorf("expected the shared extension to be dropped before dedup could rescue it\n got %q\nwant %q",
-			opts, deduped)
+	want := "lowerdir=" + strings.Join(base, ":") + ":" + own
+	if len(want) >= pageLimit {
+		t.Fatalf("test fixture is wrong: the deduplicated string must fit, got %d >= %d",
+			len(want), pageLimit)
+	}
+
+	if opts := BuildOverlayOptions(base, nil, []Extension{shared}); opts != want {
+		t.Errorf("an extension that fits once deduplicated must survive the budget\n got %q\nwant %q",
+			opts, want)
 	}
 }

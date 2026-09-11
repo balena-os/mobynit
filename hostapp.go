@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -595,14 +596,19 @@ type Extension struct {
 	Priority int
 }
 
+func lowerdirOptions(layers []string) string {
+	return "lowerdir=" + strings.Join(dedupLayers(layers), ":")
+}
+
 // BuildOverlayOptions constructs a flat overlay lowerdir mount options string
 // from per-image layer chains.
 //
 // Extensions whose chain would push the options string past the kernel
 // page-size limit are dropped as WHOLE chains (a partial chain would compose
 // a partial image): rightExtensions first, then the lowest-priority
-// leftExtensions. Drops are logged per name. The set that fits is logged in
-// mount order.
+// leftExtensions. The limit applies to the deduplicated string, so a layer an
+// extension shares with the base counts once. Drops are logged per name. The
+// set that fits is logged in mount order.
 func BuildOverlayOptions(baseLayers []string, leftExtensions, rightExtensions []Extension) string {
 	sort.Slice(leftExtensions, func(i, j int) bool {
 		if leftExtensions[i].Priority != leftExtensions[j].Priority {
@@ -612,41 +618,41 @@ func BuildOverlayOptions(baseLayers []string, leftExtensions, rightExtensions []
 	})
 
 	pageLimit := os.Getpagesize() - 1
-	base := strings.Join(baseLayers, ":")
 
-	prefix := "lowerdir="
+	// The kernel receives the deduplicated string, so measure that one.
+	// Carrying the raw chains keeps one dedup call, at the end.
+	fits := func(layers []string) bool { return len(lowerdirOptions(layers)) < pageLimit }
+
+	var left []string
 	leftIncluded := 0
 	for _, e := range leftExtensions {
-		chain := strings.Join(e.Layers, ":")
-		candidate := prefix + chain + ":" + base
-		if len(candidate) >= pageLimit {
+		if !fits(slices.Concat(left, e.Layers, baseLayers)) {
 			break
 		}
-		prefix += chain + ":"
+		left = slices.Concat(left, e.Layers)
 		leftIncluded++
 	}
 	for _, e := range leftExtensions[leftIncluded:] {
 		log.Printf("Warning: extension %q dropped due to page size limit", e.Name)
 	}
 
-	opts := prefix + base
+	layers := slices.Concat(left, baseLayers)
 
 	// Phase 2: append rightExtensions as space allows
 	rightIncluded := 0
 	for _, e := range rightExtensions {
-		candidate := opts + ":" + strings.Join(e.Layers, ":")
-		if len(candidate) >= pageLimit {
+		candidate := slices.Concat(layers, e.Layers)
+		if !fits(candidate) {
 			break
 		}
-		opts = candidate
+		layers = candidate
 		rightIncluded++
 	}
 	for _, e := range rightExtensions[rightIncluded:] {
 		log.Printf("Warning: extension %q dropped due to page size limit", e.Name)
 	}
 
-	// Dedup last: incremental dedup would invert layer precedence.
-	opts = "lowerdir=" + strings.Join(dedupLayers(strings.Split(strings.TrimPrefix(opts, "lowerdir="), ":")), ":")
+	opts := lowerdirOptions(layers)
 
 	// Log what fit, in mount order
 	log.Println("Overlayed images:")
