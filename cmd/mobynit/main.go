@@ -29,7 +29,11 @@ type MountInfo struct {
 
 // getMounts parses /proc/self/mountinfo and returns mount points
 func getMounts() ([]MountInfo, error) {
-	f, err := os.Open("/proc/self/mountinfo")
+	return getMountsFrom("/proc/self/mountinfo")
+}
+
+func getMountsFrom(path string) ([]MountInfo, error) {
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}

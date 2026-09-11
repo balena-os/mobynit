@@ -16,6 +16,8 @@ func TestGetMounts_RealMounts(t *testing.T) {
 		t.Skip("requires root")
 	}
 
+	// The mount namespace is per thread: lock before unsharing
+	runtime.LockOSThread()
 	// Create new mount namespace to isolate test mounts
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		t.Fatalf("failed to create mount namespace: %v", err)
@@ -33,20 +35,7 @@ func TestGetMounts_RealMounts(t *testing.T) {
 	}
 	defer unix.Unmount(tmpDir, 0)
 
-	mounts, err := getMounts()
-	if err != nil {
-		t.Fatalf("getMounts failed: %v", err)
-	}
-
-	found := false
-	for _, mount := range mounts {
-		if mount.Mountpoint == tmpDir {
-			found = true
-			break
-		}
-	}
-
-	if !found {
+	if !mountpointSet(t)[tmpDir] {
 		t.Errorf("expected tmpfs mount at %s to appear in mounts list", tmpDir)
 	}
 }
@@ -86,6 +75,8 @@ func TestGetMounts_NestedMounts(t *testing.T) {
 		t.Skip("requires root")
 	}
 
+	// The mount namespace is per thread: lock before unsharing
+	runtime.LockOSThread()
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		t.Fatalf("failed to create mount namespace: %v", err)
 	}
@@ -116,25 +107,11 @@ func TestGetMounts_NestedMounts(t *testing.T) {
 	}
 	defer unix.Unmount(childDir, unix.MNT_DETACH)
 
-	mounts, err := getMounts()
-	if err != nil {
-		t.Fatalf("getMounts failed: %v", err)
-	}
-
-	parentFound, childFound := false, false
-	for _, mount := range mounts {
-		if mount.Mountpoint == parentDir {
-			parentFound = true
-		}
-		if mount.Mountpoint == childDir {
-			childFound = true
-		}
-	}
-
-	if !parentFound {
+	mounts := mountpointSet(t)
+	if !mounts[parentDir] {
 		t.Error("expected parent mount to appear in mounts list")
 	}
-	if !childFound {
+	if !mounts[childDir] {
 		t.Error("expected child mount to appear in mounts list")
 	}
 }
@@ -247,7 +224,6 @@ func TestLowerdirFarmMountsUnderKernel(t *testing.T) {
 		t.Skip("requires root (or unshare -rm) to perform overlay mount")
 	}
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		t.Fatalf("unshare: %v", err)
 	}
@@ -397,12 +373,13 @@ func TestUnescapeMountpoint_TrailingBackslash(t *testing.T) {
 	}
 }
 
-// mountpointSet snapshots the current mount table as a set of mountpoints.
 func mountpointSet(t *testing.T) map[string]bool {
 	t.Helper()
-	mounts, err := getMounts()
+	// Only this thread entered the new namespace. /proc/self shows the
+	// group leader, which stayed on the host.
+	mounts, err := getMountsFrom("/proc/thread-self/mountinfo")
 	if err != nil {
-		t.Fatalf("getMounts: %v", err)
+		t.Fatalf("reading the thread mount table: %v", err)
 	}
 	set := make(map[string]bool, len(mounts))
 	for _, m := range mounts {
@@ -430,6 +407,8 @@ func TestMountDataOverlaysLeavesNoDataMountBehind(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root (or unshare -rm) to mount")
 	}
+	// The mount namespace is per thread: lock before unsharing
+	runtime.LockOSThread()
 	// Unshare first, or the change below flips the host's shared /
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		t.Skipf("cannot create mount namespace: %v", err)
@@ -458,6 +437,8 @@ func TestComposedRootSurvivesWorkMountRelease(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root (or unshare -rm) to mount")
 	}
+	// The mount namespace is per thread: lock before unsharing
+	runtime.LockOSThread()
 	// Unshare first, or the change below flips the host's shared /
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		t.Skipf("cannot create mount namespace: %v", err)
