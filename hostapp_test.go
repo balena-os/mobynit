@@ -407,7 +407,6 @@ func TestBuildLowerDirsMountsUnderKernel(t *testing.T) {
 		t.Skip("requires root (or unshare -rm) to perform overlay mount")
 	}
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		t.Fatalf("unshare: %v", err)
 	}
@@ -1340,7 +1339,6 @@ func TestSelectMountable(t *testing.T) {
 	// all run in the same (unshared) mount namespace; otherwise the Go
 	// scheduler can migrate the goroutine across threads in different namespaces.
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	// Isolate so the test's mounts never leak into the host namespace.
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		t.Fatalf("unshare: %v", err)
@@ -1436,7 +1434,6 @@ func TestFlatComposeDepthBudget(t *testing.T) {
 		t.Skip("requires root to perform overlay mounts")
 	}
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		t.Fatalf("unshare: %v", err)
 	}
@@ -1564,7 +1561,6 @@ func TestFlatComposeWhiteoutSemantics(t *testing.T) {
 		t.Skip("requires root for mknod/setxattr/overlay mounts")
 	}
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		t.Fatalf("unshare: %v", err)
 	}
@@ -1706,7 +1702,6 @@ func TestFlatComposeDedupSharedBaseKernel(t *testing.T) {
 		t.Skip("requires root to perform overlay mounts")
 	}
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		t.Fatalf("unshare: %v", err)
 	}
