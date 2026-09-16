@@ -16,6 +16,8 @@ func TestGetMounts_RealMounts(t *testing.T) {
 		t.Skip("requires root")
 	}
 
+	// The mount namespace is per thread: lock before unsharing
+	runtime.LockOSThread()
 	// Create new mount namespace to isolate test mounts
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		t.Fatalf("failed to create mount namespace: %v", err)
@@ -33,20 +35,7 @@ func TestGetMounts_RealMounts(t *testing.T) {
 	}
 	defer unix.Unmount(tmpDir, 0)
 
-	mounts, err := getMounts()
-	if err != nil {
-		t.Fatalf("getMounts failed: %v", err)
-	}
-
-	found := false
-	for _, mount := range mounts {
-		if mount.Mountpoint == tmpDir {
-			found = true
-			break
-		}
-	}
-
-	if !found {
+	if !mountpointSet(t)[tmpDir] {
 		t.Errorf("expected tmpfs mount at %s to appear in mounts list", tmpDir)
 	}
 }
@@ -86,6 +75,8 @@ func TestGetMounts_NestedMounts(t *testing.T) {
 		t.Skip("requires root")
 	}
 
+	// The mount namespace is per thread: lock before unsharing
+	runtime.LockOSThread()
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		t.Fatalf("failed to create mount namespace: %v", err)
 	}
@@ -116,25 +107,11 @@ func TestGetMounts_NestedMounts(t *testing.T) {
 	}
 	defer unix.Unmount(childDir, unix.MNT_DETACH)
 
-	mounts, err := getMounts()
-	if err != nil {
-		t.Fatalf("getMounts failed: %v", err)
-	}
-
-	parentFound, childFound := false, false
-	for _, mount := range mounts {
-		if mount.Mountpoint == parentDir {
-			parentFound = true
-		}
-		if mount.Mountpoint == childDir {
-			childFound = true
-		}
-	}
-
-	if !parentFound {
+	mounts := mountpointSet(t)
+	if !mounts[parentDir] {
 		t.Error("expected parent mount to appear in mounts list")
 	}
-	if !childFound {
+	if !mounts[childDir] {
 		t.Error("expected child mount to appear in mounts list")
 	}
 }
@@ -247,7 +224,6 @@ func TestLowerdirFarmMountsUnderKernel(t *testing.T) {
 		t.Skip("requires root (or unshare -rm) to perform overlay mount")
 	}
 	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
 		t.Fatalf("unshare: %v", err)
 	}
@@ -394,5 +370,120 @@ func TestUnescapeMountpoint_TrailingBackslash(t *testing.T) {
 	result := unescapeMountpoint(input)
 	if result != input {
 		t.Errorf("expected %q (unchanged), got %q", input, result)
+	}
+}
+
+func mountpointSet(t *testing.T) map[string]bool {
+	t.Helper()
+	// Only this thread entered the new namespace. /proc/self shows the
+	// group leader, which stayed on the host.
+	mounts, err := getMountsFrom("/proc/thread-self/mountinfo")
+	if err != nil {
+		t.Fatalf("reading the thread mount table: %v", err)
+	}
+	set := make(map[string]bool, len(mounts))
+	for _, m := range mounts {
+		set[m.Mountpoint] = true
+	}
+	return set
+}
+
+// withFakeDataPartition points the data partition lookup at a tmpfs, so the
+// test needs no block device.
+func withFakeDataPartition(t *testing.T) {
+	t.Helper()
+	stateDir := t.TempDir()
+	if err := os.Symlink("/dev/null", filepath.Join(stateDir, DATA_STATE_NAME)); err != nil {
+		t.Fatalf("creating by-state fixture: %v", err)
+	}
+	prevDir, prevFstype := stateDiskDir, dataFstype
+	stateDiskDir, dataFstype = stateDir, "tmpfs"
+	t.Cleanup(func() { stateDiskDir, dataFstype = prevDir, prevFstype })
+}
+
+// The work mount must not survive the call. The booted system would inherit
+// it as a second, shadowed data mount that nothing releases.
+func TestMountDataOverlaysLeavesNoDataMountBehind(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root (or unshare -rm) to mount")
+	}
+	// The mount namespace is per thread: lock before unsharing
+	runtime.LockOSThread()
+	// Unshare first, or the change below flips the host's shared /
+	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+		t.Skipf("cannot create mount namespace: %v", err)
+	}
+	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
+		t.Skipf("cannot make mounts private: %v", err)
+	}
+	withFakeDataPartition(t)
+
+	newRoot := t.TempDir()
+	before := mountpointSet(t)
+	// No purge marker on an empty tmpfs: the early-return path
+	if err := mountDataOverlays(newRoot, nil); err != nil {
+		t.Fatalf("mountDataOverlays: %v", err)
+	}
+
+	for mp := range mountpointSet(t) {
+		if !before[mp] {
+			t.Errorf("mountDataOverlays leaked a mount at %s", mp)
+		}
+	}
+}
+
+// The composed root keeps serving layers from a released work mount.
+func TestComposedRootSurvivesWorkMountRelease(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root (or unshare -rm) to mount")
+	}
+	// The mount namespace is per thread: lock before unsharing
+	runtime.LockOSThread()
+	// Unshare first, or the change below flips the host's shared /
+	if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+		t.Skipf("cannot create mount namespace: %v", err)
+	}
+	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
+		t.Skipf("cannot make mounts private: %v", err)
+	}
+
+	work := t.TempDir()
+	if err := unix.Mount("tmpfs", work, "tmpfs", 0, ""); err != nil {
+		t.Fatalf("mounting work tmpfs: %v", err)
+	}
+	defer unix.Unmount(work, unix.MNT_DETACH)
+
+	// Two layers: overlayfs refuses a single lowerdir with no upperdir
+	extLayer := filepath.Join(work, "ext")
+	baseLayer := filepath.Join(work, "base")
+	for _, d := range []string{extLayer, baseLayer} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("creating layer %s: %v", d, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(extLayer, "marker"), []byte("extension"), 0o644); err != nil {
+		t.Fatalf("writing marker: %v", err)
+	}
+
+	composed := t.TempDir()
+	opts := "lowerdir=" + extLayer + ":" + baseLayer
+	if err := unix.Mount("overlay", composed, "overlay", 0, opts); err != nil {
+		t.Skipf("overlay mount unavailable: %v", err)
+	}
+	defer unix.Unmount(composed, unix.MNT_DETACH)
+
+	if err := unix.Unmount(work, unix.MNT_DETACH); err != nil {
+		t.Fatalf("detaching work mount: %v", err)
+	}
+	if mountpointSet(t)[work] {
+		t.Errorf("work mount still in the namespace at %s after detach", work)
+	}
+
+	got, err := os.ReadFile(filepath.Join(composed, "marker"))
+	if err != nil {
+		t.Fatalf("composed root unreadable after detach: %v", err)
+	}
+	if string(got) != "extension" {
+		t.Errorf("composed root content = %q, want %q", got, "extension")
 	}
 }

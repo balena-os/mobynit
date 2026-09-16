@@ -4,11 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -38,7 +40,7 @@ type Container struct {
 	Config
 	MountPath string
 	HomePath  string
-	Layers []string
+	Layers    []string
 }
 
 var (
@@ -173,15 +175,17 @@ func (container *Container) initialize(homePath string) error {
 	return nil
 }
 
-// initializeContainers finds and mounts containers
-func initializeContainers(rootdir string, match string) ([]Container, error) {
+// readContainers returns the matching container records without mounting them.
+// It drops dead and removal-in-progress containers, so every caller sees the
+// same set as the mount path.
+func readContainers(rootdir string, match string) ([]Container, error) {
 	containersDir := filepath.Join(rootdir, "containers")
 	entries, err := os.ReadDir(containersDir)
 	if err != nil {
 		return nil, fmt.Errorf("reading containers directory: %w", err)
 	}
 
-	var mountedContainers []Container
+	var found []Container
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -214,11 +218,27 @@ func initializeContainers(rootdir string, match string) ([]Container, error) {
 			continue
 		}
 
-		if _, err := container.mount(rootdir); err != nil {
+		found = append(found, container)
+	}
+
+	return found, nil
+}
+
+// initializeContainers finds and mounts containers
+func initializeContainers(rootdir string, match string) ([]Container, error) {
+	containers, err := readContainers(rootdir, match)
+	if err != nil {
+		return nil, err
+	}
+
+	var mountedContainers []Container
+
+	for i := range containers {
+		if _, err := containers[i].mount(rootdir); err != nil {
 			log.Println("Failed to mount container:", err)
-		} else {
-			mountedContainers = append(mountedContainers, container)
+			continue
 		}
+		mountedContainers = append(mountedContainers, containers[i])
 	}
 
 	return mountedContainers, nil
@@ -233,11 +253,127 @@ func Mount(rootdir string, label string) ([]Container, error) {
 }
 
 const (
+	HOSTOS_BLOCKS_CLASS          = "io.balena.image.class"
 	HOSTOS_BLOCKS_OVERRIDE       = "io.balena.image.override"
 	HOSTOS_BLOCKS_KERNEL_VERSION = "io.balena.image.kernel-version"
 	HOSTOS_BLOCKS_KERNEL_ABI_ID  = "io.balena.image.kernel-abi-id"
 	CMDLINE_KERNEL_ABI           = "balena_kernel_abi"
+	PURGE_MARKER_FILE            = "remove_me_to_reset"
+	// Container store directory inside the data partition
+	DATA_LAYER_ROOT = "docker"
 )
+
+// ErrClaimsUnavailable reports that the deployed kernel ABI claims cannot be
+// determined from the store.
+var ErrClaimsUnavailable = errors.New("cannot determine the deployed kernel ABI claims")
+
+// dataDirOf returns the data partition that holds a docker data root. The
+// store is DATA_LAYER_ROOT inside the partition. Any other base name means
+// the caller is one level off. The marker lookup would then read the wrong
+// directory.
+func dataDirOf(dockerRoot string) (string, error) {
+	clean := filepath.Clean(dockerRoot)
+	if filepath.Base(clean) != DATA_LAYER_ROOT {
+		return "", fmt.Errorf("%q is not a %s data root", dockerRoot, DATA_LAYER_ROOT)
+	}
+	return filepath.Dir(clean), nil
+}
+
+// PurgePending reports whether this boot wipes the data partition. An absent
+// PURGE_MARKER_FILE arms the purge. An unreadable one says nothing about the
+// state, so it counts as armed. The error names the marker path.
+func PurgePending(dataDir string) (bool, error) {
+	if _, err := os.Stat(filepath.Join(dataDir, PURGE_MARKER_FILE)); err != nil {
+		return true, err
+	}
+	return false, nil
+}
+
+const abiIDLen = sha256.Size * 2
+
+// validABIID reports whether s is a lowercase sha256 hex digest.
+func validABIID(s string) bool {
+	if len(s) != abiIDLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// ClaimedKernelABIs returns the kernel ABI ids that deployed extensions
+// claim. It reads the container store directly, with no engine running.
+//
+// A claim is not a promise that the boot mounts the modules: the pid 1 mount
+// path applies filters this query does not model.
+//
+// A label that is not a lowercase sha256 hex digest is not a claim: the
+// query logs it and drops it.
+//
+// rootdir is the docker data root, <data>/docker. A caller that passes the
+// data partition itself gets ErrClaimsUnavailable, which names the store
+// directory it expected.
+//
+// Four states, which callers read differently:
+//
+//	data root absent                          the stat error
+//	purge armed, no remove_me_to_reset        ErrClaimsUnavailable
+//	containers directory missing              ErrClaimsUnavailable
+//	containers present, none claiming an ABI  nil, nil
+//
+// A nil slice with a nil error means the claim set is empty. The boot path
+// reads ErrClaimsUnavailable as "claim nothing". A record sweeper reads it as
+// "do not act on state you cannot read".
+func ClaimedKernelABIs(rootdir string) ([]string, error) {
+	if _, err := os.Stat(rootdir); err != nil {
+		return nil, err
+	}
+
+	dataDir, err := dataDirOf(rootdir)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrClaimsUnavailable, err)
+	}
+
+	// A purge boot mounts no extension, so the deployed claims would select a
+	// kernel whose modules stay unmounted.
+	if pending, err := PurgePending(dataDir); pending {
+		return nil, fmt.Errorf("%w: %v", ErrClaimsUnavailable, err)
+	}
+
+	containers, err := readContainers(rootdir, HOSTOS_BLOCKS_CLASS)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %v", ErrClaimsUnavailable, err)
+		}
+		return nil, err
+	}
+
+	seen := make(map[string]struct{}, len(containers))
+	var abis []string
+	for _, c := range containers {
+		// activate already checked this label against the /boot bytes.
+		abi := c.Labels[HOSTOS_BLOCKS_KERNEL_ABI_ID]
+		if abi == "" {
+			continue
+		}
+		// Deployers write the store; callers match whole lines.
+		if !validABIID(abi) {
+			log.Printf("Warning: container %s: ignoring malformed %s label %q", c.Name, HOSTOS_BLOCKS_KERNEL_ABI_ID, abi)
+			continue
+		}
+		if _, dup := seen[abi]; dup {
+			continue
+		}
+		seen[abi] = struct{}{}
+		abis = append(abis, abi)
+	}
+	sort.Strings(abis)
+	return abis, nil
+}
 
 // ParseHostKernelABIID extracts the balena_kernel_abi=<value> token from a
 // kernel cmdline string and returns its value. Returns "" when the token is
@@ -306,10 +442,45 @@ func ComputeABIID(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// KernelImageForABIID returns the path of the regular file directly under
+// bootDir whose sha256 equals abi, or "" when nothing matches.
+// An empty abi and an unusable bootDir are the only errors. An absent
+// bootDir wraps os.ErrNotExist, so callers can tell "nothing matches" from
+// "cannot tell".
+// It skips the files it cannot hash and returns their errors for the caller
+// to report.
+func KernelImageForABIID(bootDir, abi string) (string, []error, error) {
+	if abi == "" {
+		return "", nil, fmt.Errorf("no kernel ABI id to match against under %s", bootDir)
+	}
+	entries, err := os.ReadDir(bootDir)
+	if err != nil {
+		return "", nil, fmt.Errorf("reading %s: %w", bootDir, err)
+	}
+	var skipped []error
+	for _, e := range entries {
+		// A symlink's bytes could live outside the extension
+		if !e.Type().IsRegular() {
+			continue
+		}
+		image := filepath.Join(bootDir, e.Name())
+		id, err := ComputeABIID(image)
+		if err != nil {
+			// An unreadable file must not mask a later match
+			skipped = append(skipped, err)
+			continue
+		}
+		if id == abi {
+			return image, skipped, nil
+		}
+	}
+	return "", skipped, nil
+}
+
 // ResolveExtensionABIID returns the extension's kernel identity claim.
-// * The extension carries a modules tree
-// * A file directly under the extension's /boot (the shipped kernel image)
-//   hashes to hostABIID, the balena_kernel_abi cmdline token.
+//   - The extension carries a modules tree
+//   - A file directly under the extension's /boot (the shipped kernel image)
+//     hashes to hostABIID, the balena_kernel_abi cmdline token.
 //
 // Returns "" (no claim) when:
 // * The extension is unmounted
@@ -356,31 +527,21 @@ func (c *Container) ResolveExtensionABIID(release, hostABIID string) (string, er
 	}
 
 	bootDir := filepath.Join(c.MountPath, "boot")
-	entries, err := os.ReadDir(bootDir)
+	image, skipped, err := KernelImageForABIID(bootDir, hostABIID)
+	for _, s := range skipped {
+		log.Printf("Warning: extension %s: %v", c.Name, s)
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
+		// os.IsNotExist does not unwrap
+		if errors.Is(err, os.ErrNotExist) {
 			return "", fmt.Errorf("broken extension %s: modules present but no kernel image under /boot", c.Name)
 		}
-		return "", fmt.Errorf("broken extension %s: reading %s: %w", c.Name, bootDir, err)
+		return "", fmt.Errorf("broken extension %s: %w", c.Name, err)
 	}
-	for _, e := range entries {
-		// Regular files only: following a symlink would let the bytes we
-		// verify live outside the extension being verified.
-		if !e.Type().IsRegular() {
-			continue
-		}
-		id, err := ComputeABIID(filepath.Join(bootDir, e.Name()))
-		if err != nil {
-			// One unreadable file must not mask a valid match elsewhere
-			// under /boot; a genuine no-match still fails below.
-			log.Printf("Warning: extension %s: skipping unreadable /boot file: %v", c.Name, err)
-			continue
-		}
-		if id == hostABIID {
-			return id, nil
-		}
+	if image == "" {
+		return "", fmt.Errorf("extension %s: no /boot kernel image matches running kernel %q", c.Name, hostABIID)
 	}
-	return "", fmt.Errorf("extension %s: no /boot kernel image matches running kernel %q", c.Name, hostABIID)
+	return hostABIID, nil
 }
 
 // FilterByKernelABIID keeps only those containers safe to mount over the
@@ -459,14 +620,19 @@ type Extension struct {
 	Priority int
 }
 
+func lowerdirOptions(layers []string) string {
+	return "lowerdir=" + strings.Join(dedupLayers(layers), ":")
+}
+
 // BuildOverlayOptions constructs a flat overlay lowerdir mount options string
 // from per-image layer chains.
 //
 // Extensions whose chain would push the options string past the kernel
 // page-size limit are dropped as WHOLE chains (a partial chain would compose
 // a partial image): rightExtensions first, then the lowest-priority
-// leftExtensions. Drops are logged per name. The set that fits is logged in
-// mount order.
+// leftExtensions. The limit applies to the deduplicated string, so a layer an
+// extension shares with the base counts once. Drops are logged per name. The
+// set that fits is logged in mount order.
 func BuildOverlayOptions(baseLayers []string, leftExtensions, rightExtensions []Extension) string {
 	sort.Slice(leftExtensions, func(i, j int) bool {
 		if leftExtensions[i].Priority != leftExtensions[j].Priority {
@@ -476,41 +642,41 @@ func BuildOverlayOptions(baseLayers []string, leftExtensions, rightExtensions []
 	})
 
 	pageLimit := os.Getpagesize() - 1
-	base := strings.Join(baseLayers, ":")
 
-	prefix := "lowerdir="
+	// The kernel receives the deduplicated string, so measure that one.
+	// Carrying the raw chains keeps one dedup call, at the end.
+	fits := func(layers []string) bool { return len(lowerdirOptions(layers)) < pageLimit }
+
+	var left []string
 	leftIncluded := 0
 	for _, e := range leftExtensions {
-		chain := strings.Join(e.Layers, ":")
-		candidate := prefix + chain + ":" + base
-		if len(candidate) >= pageLimit {
+		if !fits(slices.Concat(left, e.Layers, baseLayers)) {
 			break
 		}
-		prefix += chain + ":"
+		left = slices.Concat(left, e.Layers)
 		leftIncluded++
 	}
 	for _, e := range leftExtensions[leftIncluded:] {
 		log.Printf("Warning: extension %q dropped due to page size limit", e.Name)
 	}
 
-	opts := prefix + base
+	layers := slices.Concat(left, baseLayers)
 
 	// Phase 2: append rightExtensions as space allows
 	rightIncluded := 0
 	for _, e := range rightExtensions {
-		candidate := opts + ":" + strings.Join(e.Layers, ":")
-		if len(candidate) >= pageLimit {
+		candidate := slices.Concat(layers, e.Layers)
+		if !fits(candidate) {
 			break
 		}
-		opts = candidate
+		layers = candidate
 		rightIncluded++
 	}
 	for _, e := range rightExtensions[rightIncluded:] {
 		log.Printf("Warning: extension %q dropped due to page size limit", e.Name)
 	}
 
-	// Dedup shared layers AFTER the page-budget drops
-	opts = "lowerdir=" + strings.Join(dedupLayers(strings.Split(strings.TrimPrefix(opts, "lowerdir="), ":")), ":")
+	opts := lowerdirOptions(layers)
 
 	// Log what fit, in mount order
 	log.Println("Overlayed images:")
