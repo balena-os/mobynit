@@ -1,4 +1,103 @@
 - commits:
+    - subject: "hostapp: count shared layers once against the page budget"
+      hash: 3aceafaac065f679af4953b5824b87fea87c8e35
+      body: |
+        Make the budget check measure the deduplicated string so that a dropped
+        extension does not count for the limit.
+      footer:
+        Change-type: patch
+        change-type: patch
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+    - subject: "mobynit(fixtures): read the mount table of the unshared thread"
+      hash: 4db314f82f5cd2a1b7e996fdd0b29e7cbec22d92
+      body: |
+        Fix test fixtures not to leak to the mount hosts or another namespace so
+        that the results are valid.
+      footer:
+        Change-type: patch
+        change-type: patch
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+    - subject: "mobynit: keep stderr logging when the log file cannot open"
+      hash: 12eca34c30e20dd28ffb7b196304e1bdea881728
+      body: ""
+      footer:
+        Change-type: patch
+        change-type: patch
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+    - subject: "hostapp: export the /boot kernel image match"
+      hash: cf3c1115f3556881808adee97620c99f640e4d42
+      body: |
+        Allow consumers to verify the same claim.
+
+        A directory holding no match stays ("", nil) and an absent one
+        wraps os.ErrNotExist, so callers can tell "nothing matches"
+        from "cannot tell".
+      footer:
+        Change-type: minor
+        change-type: minor
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+    - subject: "mobynit: report no kernel ABI claims on a purge boot"
+      hash: 33f29d5771680e1559498b7b0103304ddff7f258
+      body: >
+        When a purge boot is scheduled to wipe the data partision have
+        ClaimedKernelABIs
+
+        answer correctly.
+      footer:
+        Change-type: patch
+        change-type: patch
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+    - subject: "mobynit: prevent data partition double mount"
+      hash: 66f000c1fd08904a545894f4de74a0ddc35dbea2
+      body: |
+        Detach the data partition once it is no longer needed.
+      footer:
+        Change-type: patch
+        change-type: patch
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+    - subject: "hostapp: report kernel ABIs claimed by deployed extensions"
+      hash: 943c3c6b7b6e75b1bf19aa0bd4e21b676e5b7d92
+      body: >
+        This commit adds a parameter to report the kernel ABI id claimed by
+
+        the extension containers a boot would mount, read straight from the
+
+        container store.
+
+
+        Dead and containers in process of removal do not count because the mount
+        path
+
+        drops them and they therefore contribute no modules.
+      footer:
+        Change-type: minor
+        change-type: minor
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+  version: 1.2.0
+  title: ""
+  date: 2026-09-16T15:37:58.125Z
+- commits:
     - subject: "hostapp: compose the root as a flat single depth overlay"
       hash: 9df64079b61a6a1a9bca0674367078564a3f55f5
       body: >
