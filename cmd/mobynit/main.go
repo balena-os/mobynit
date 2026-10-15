@@ -91,6 +91,7 @@ const (
 	LOG_DIR                  = "/tmp/initramfs/"
 	LOG_FILE                 = "initramfs.debug"
 	CMDLINE_DISABLE_OVERLAYS = "mobynit.no_overlays"
+	CMDLINE_EMERGENCY        = "emergency"
 	DATA_WORK_DIR            = "/tmp/mobynit-data"
 	DATA_STATE_NAME          = "resin-data"
 )
@@ -320,6 +321,26 @@ func prepareForPivot() (string, error) {
 	return newRootPath, nil
 }
 
+// Tokens match as a substring of any argument, which is what kexec reproduces.
+func cmdlineDisablesOverlays(cmdline string) bool {
+	for _, arg := range strings.Fields(cmdline) {
+		if strings.Contains(arg, CMDLINE_EMERGENCY) || strings.Contains(arg, CMDLINE_DISABLE_OVERLAYS) {
+			return true
+		}
+	}
+	return false
+}
+
+// An unreadable command line disables nothing, as the pivot path has always done.
+func overlaysDisabledByCmdline() bool {
+	content, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		log.Printf("warning: could not read /proc/cmdline: %v (overlay flags ignored)", err)
+		return false
+	}
+	return cmdlineDisablesOverlays(string(content))
+}
+
 func main() {
 	sysrootPtr := flag.String("sysroot", "", "root of partition e.g. /mnt/sysroot/inactive. Mount destination is returned in stdout")
 	claimedPtr := flag.String("claimed-abis", "", "docker data root to report the kernel ABI ids whose modules this boot will mount, one per line, then exit")
@@ -337,6 +358,12 @@ func main() {
 		if *claimedPtr == "" {
 			// Fail closed: a fall-through would pivot in the bootloader initramfs
 			log.Fatalln("-claimed-abis requires a docker data root path")
+		}
+		// The flag reports what this boot will mount, and with the overlays
+		// off it mounts none. Claim nothing so kexec falls back to stock.
+		if overlaysDisabledByCmdline() {
+			log.Println("Claiming no kernel ABI: overlays disabled on the command line")
+			return
 		}
 		// A store this boot cannot read is a store it will not mount, so
 		// every error claims nothing and the caller boots the stock kernel.
@@ -374,17 +401,7 @@ func main() {
 		log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 	}
 
-	content, err := os.ReadFile("/proc/cmdline")
-	if err != nil {
-		log.Printf("warning: could not read /proc/cmdline: %v (overlay flags ignored)", err)
-	} else {
-		args := strings.Fields(string(content))
-		for _, arg := range args {
-			if strings.Contains(arg, "emergency") || strings.Contains(arg, CMDLINE_DISABLE_OVERLAYS) {
-				disable_overlays = true
-			}
-		}
-	}
+	disable_overlays = overlaysDisabledByCmdline()
 
 	// Any mounts done by initrd will be transfered in the new root
 	mounts, err := getMounts()
