@@ -41,8 +41,8 @@ mobynit -claimed-abis=/path  # Print claimed kernel ABI ids and exit
 `-claimed-abis=<docker data root>` prints the
 `io.balena.image.kernel-abi-id` of every OS block container in the store. It
 prints one id per line, then exits. It prints nothing when `emergency` or
-`mobynit.no_overlays` is on the kernel command line, because that boot mounts
-no OS block.
+`mobynit.no_overlays` is on the kernel command line. That boot mounts no OS
+block.
 
 The output is a set. Its order carries no meaning: the sort only makes the
 output stable for comparison and for tests. A caller holds the ABI it is

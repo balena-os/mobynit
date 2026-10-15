@@ -422,7 +422,7 @@ func TestMountDataOverlaysLeavesNoDataMountBehind(t *testing.T) {
 	newRoot := t.TempDir()
 	before := mountpointSet(t)
 	// No purge marker on an empty tmpfs: the early-return path
-	if err := mountDataOverlays(newRoot, nil); err != nil {
+	if err := mountDataOverlays(newRoot, nil, ""); err != nil {
 		t.Fatalf("mountDataOverlays: %v", err)
 	}
 

@@ -174,7 +174,7 @@ func mountSysroot(rootdir string) ([]hostapp.Container, error) {
 	return containers, err
 }
 
-func mountDataOverlays(newRootPath string, baseLayers []string) error {
+func mountDataOverlays(newRootPath string, baseLayers []string, cmdline string) error {
 	device, err := os.Readlink(filepath.Join(stateDiskDir, DATA_STATE_NAME))
 	if err != nil {
 		return fmt.Errorf("No udev by-state resin-data symbolic link")
@@ -217,11 +217,7 @@ func mountDataOverlays(newRootPath string, baseLayers []string) error {
 		log.Printf("Warning: could not get kernel release: %v", err)
 	}
 
-	cmdline, err := os.ReadFile("/proc/cmdline")
-	if err != nil {
-		log.Printf("Warning: could not read /proc/cmdline: %v", err)
-	}
-	hostABIID := hostapp.ParseHostKernelABIID(string(cmdline))
+	hostABIID := hostapp.ParseHostKernelABIID(cmdline)
 
 	containers = hostapp.SelectMountable(containers, release, hostABIID)
 	if len(containers) == 0 {
@@ -274,7 +270,7 @@ func mountDataOverlays(newRootPath string, baseLayers []string) error {
 	return nil
 }
 
-func prepareForPivot(overlaysDisabled bool) (string, error) {
+func prepareForPivot(cmdline string) (string, error) {
 	var newRootPath string
 	if err := os.MkdirAll("/dev/shm", os.ModePerm); err != nil {
 		return "", fmt.Errorf("Creating /dev/shm failed: %v", err)
@@ -310,8 +306,8 @@ func prepareForPivot(overlaysDisabled bool) (string, error) {
 		return newRootPath, fmt.Errorf("Creating %s failed: %v", PIVOT_PATH, err)
 	}
 
-	if !overlaysDisabled {
-		if err := mountDataOverlays(newRootPath, containers[0].Layers); err != nil {
+	if !cmdlineDisablesOverlays(cmdline) {
+		if err := mountDataOverlays(newRootPath, containers[0].Layers, cmdline); err != nil {
 			log.Print(err)
 		}
 	}
@@ -339,13 +335,12 @@ func cmdlineDisablesOverlays(cmdline string) bool {
 }
 
 // Unreadable cmdline disables nothing.
-func overlaysDisabledByCmdline() bool {
+func readCmdline() string {
 	content, err := os.ReadFile("/proc/cmdline")
 	if err != nil {
 		log.Printf("warning: could not read /proc/cmdline: %v (overlay flags ignored)", err)
-		return false
 	}
-	return cmdlineDisablesOverlays(string(content))
+	return string(content)
 }
 
 func main() {
@@ -366,7 +361,7 @@ func main() {
 			// Fail closed: a fall-through would pivot in the bootloader initramfs
 			log.Fatalln("-claimed-abis requires a docker data root path")
 		}
-		for _, abi := range claimedABIs(*claimedPtr, overlaysDisabledByCmdline()) {
+		for _, abi := range claimedABIs(*claimedPtr, cmdlineDisablesOverlays(readCmdline())) {
 			fmt.Println(abi)
 		}
 		return
@@ -394,7 +389,7 @@ func main() {
 		log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 	}
 
-	overlaysDisabled := overlaysDisabledByCmdline()
+	cmdline := readCmdline()
 
 	// Any mounts done by initrd will be transfered in the new root
 	mounts, err := getMounts()
@@ -406,7 +401,7 @@ func main() {
 		log.Fatalln("error remounting root as read/write:", err)
 	}
 
-	newRoot, err := prepareForPivot(overlaysDisabled)
+	newRoot, err := prepareForPivot(cmdline)
 	if err != nil {
 		log.Fatalln("Error preparing for pivot root:", err)
 	}
