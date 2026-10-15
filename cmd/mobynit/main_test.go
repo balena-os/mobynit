@@ -487,3 +487,34 @@ func TestComposedRootSurvivesWorkMountRelease(t *testing.T) {
 		t.Errorf("composed root content = %q, want %q", got, "extension")
 	}
 }
+
+func TestCmdlineDisablesOverlays_Absent(t *testing.T) {
+	if cmdlineDisablesOverlays("root=UUID=1234 rootwait console=tty0") {
+		t.Error("expected overlays to stay enabled")
+	}
+}
+
+func TestCmdlineDisablesOverlays_Empty(t *testing.T) {
+	if cmdlineDisablesOverlays("") {
+		t.Error("expected an empty command line to leave overlays enabled")
+	}
+}
+
+func TestCmdlineDisablesOverlays_NoOverlays(t *testing.T) {
+	if !cmdlineDisablesOverlays("root=UUID=1234 mobynit.no_overlays") {
+		t.Error("expected mobynit.no_overlays to disable overlays")
+	}
+}
+
+func TestCmdlineDisablesOverlays_Emergency(t *testing.T) {
+	if !cmdlineDisablesOverlays("root=UUID=1234 emergency") {
+		t.Error("expected emergency to disable overlays")
+	}
+}
+
+func TestCmdlineDisablesOverlays_Substring(t *testing.T) {
+	// The substring match is the contract kexec mirrors, so pin it
+	if !cmdlineDisablesOverlays("root=UUID=1234 systemd.unit=emergency.target") {
+		t.Error("expected a substring match to disable overlays")
+	}
+}
