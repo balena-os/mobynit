@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/balena-os/hostapp"
 	"golang.org/x/sys/unix"
 )
 
@@ -485,5 +486,70 @@ func TestComposedRootSurvivesWorkMountRelease(t *testing.T) {
 	}
 	if string(got) != "extension" {
 		t.Errorf("composed root content = %q, want %q", got, "extension")
+	}
+}
+
+func TestCmdlineDisablesOverlays(t *testing.T) {
+	tests := []struct {
+		name, cmdline string
+		want          bool
+	}{
+		{"absent", "root=UUID=1234 rootwait console=tty0", false},
+		{"empty", "", false},
+		{"no_overlays", "root=UUID=1234 mobynit.no_overlays", true},
+		{"emergency", "root=UUID=1234 emergency", true},
+		// Pin the substring match the pivot path always had
+		{"substring", "root=UUID=1234 systemd.unit=emergency.target", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cmdlineDisablesOverlays(tc.cmdline); got != tc.want {
+				t.Errorf("cmdlineDisablesOverlays(%q) = %v, want %v", tc.cmdline, got, tc.want)
+			}
+		})
+	}
+}
+
+// claimingStore returns a data root claiming abi.
+func claimingStore(t *testing.T, abi string) string {
+	t.Helper()
+	data := t.TempDir()
+	if err := os.WriteFile(filepath.Join(data, hostapp.PURGE_MARKER_FILE), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(data, hostapp.DATA_LAYER_ROOT)
+	home := filepath.Join(root, "containers", "01")
+	if err := os.MkdirAll(home, 0755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"ID":"aaa1","Name":"ext","Driver":"overlay2","Config":{"Labels":{"` +
+		hostapp.HOSTOS_BLOCKS_CLASS + `":"overlay","` +
+		hostapp.HOSTOS_BLOCKS_KERNEL_ABI_ID + `":"` + abi + `"}}}`
+	if err := os.WriteFile(filepath.Join(home, "config.v2.json"), []byte(config), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func TestClaimedABIs(t *testing.T) {
+	abi := strings.Repeat("a1", 32)
+	store := claimingStore(t, abi)
+	tests := []struct {
+		name             string
+		dataRoot         string
+		overlaysDisabled bool
+		want             []string
+	}{
+		{"store claims", store, false, []string{abi}},
+		// Claims nothing even though the store claims
+		{"overlays disabled", store, true, nil},
+		{"unreadable store", filepath.Join(t.TempDir(), "docker"), false, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := claimedABIs(tc.dataRoot, tc.overlaysDisabled); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("claimedABIs(%q, %v) = %v, want %v", tc.dataRoot, tc.overlaysDisabled, got, tc.want)
+			}
+		})
 	}
 }
