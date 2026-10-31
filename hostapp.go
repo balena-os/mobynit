@@ -41,6 +41,8 @@ type Container struct {
 	MountPath string
 	HomePath  string
 	Layers    []string
+	// Carries the running kernel, per ResolveExtensionABIID.
+	ClaimsKernel bool
 }
 
 var (
@@ -555,10 +557,12 @@ func FilterByKernelABIID(containers []Container, release, hostABIID string) []Co
 	var filtered []Container
 	for i := range containers {
 		c := &containers[i]
-		if _, err := c.ResolveExtensionABIID(release, hostABIID); err != nil {
+		abi, err := c.ResolveExtensionABIID(release, hostABIID)
+		if err != nil {
 			log.Printf("Error: dropping container %s: %v", c.Name, err)
 			continue
 		}
+		c.ClaimsKernel = abi != ""
 		filtered = append(filtered, *c)
 	}
 	return filtered
@@ -618,6 +622,10 @@ type Extension struct {
 	Name     string
 	Layers   []string
 	Priority int
+	// Only an override can replace hostapp files.
+	Override     bool
+	MountPath    string
+	ClaimsKernel bool
 }
 
 func lowerdirOptions(layers []string) string {
@@ -632,8 +640,9 @@ func lowerdirOptions(layers []string) string {
 // a partial image): rightExtensions first, then the lowest-priority
 // leftExtensions. The limit applies to the deduplicated string, so a layer an
 // extension shares with the base counts once. Drops are logged per name. The
-// set that fits is logged in mount order.
-func BuildOverlayOptions(baseLayers []string, leftExtensions, rightExtensions []Extension) string {
+// function logs the set that fits in mount order. It returns that set in
+// lowerdir order.
+func BuildOverlayOptions(baseLayers []string, leftExtensions, rightExtensions []Extension) (string, []Extension) {
 	sort.Slice(leftExtensions, func(i, j int) bool {
 		if leftExtensions[i].Priority != leftExtensions[j].Priority {
 			return leftExtensions[i].Priority < leftExtensions[j].Priority
@@ -694,5 +703,73 @@ func BuildOverlayOptions(baseLayers []string, leftExtensions, rightExtensions []
 		idx++
 	}
 
-	return opts
+	return opts, slices.Concat(leftExtensions[:leftIncluded], rightExtensions[:rightIncluded])
+}
+
+// BindClaimedModules binds the modules tree of the claiming override over
+// root's tree. A failure keeps the merged tree, because pid 1 must boot.
+func BindClaimedModules(root, release string, kept []Extension) {
+	source, others, normal := modulesBindSource(kept)
+	if len(normal) > 0 {
+		log.Printf("Error: normal extensions %v claim kernel %s; only an override can own its modules tree", normal, release)
+	}
+	if source == nil {
+		return
+	}
+	if len(others) > 0 {
+		log.Printf("Warning: extensions %v also claim kernel %s; using %s", others, release, source.Name)
+	}
+	src, err := resolveModulesDir(source.MountPath, release)
+	if err != nil {
+		log.Printf("Error: modules tree of extension %s: %v; keeping merged tree", source.Name, err)
+		return
+	}
+	dst, err := resolveModulesDir(root, release)
+	if err != nil {
+		log.Printf("Error: root modules tree: %v; keeping merged tree", err)
+		return
+	}
+	if err := unix.Mount(src, dst, "", unix.MS_BIND, ""); err != nil {
+		log.Printf("Error: binding %s over %s: %v; keeping merged tree", src, dst, err)
+		return
+	}
+	log.Printf("Bound modules of extension %s for kernel %s over the root", source.Name, release)
+}
+
+// modulesBindSource returns the first override claimer in kept, which is in
+// lowerdir order. The modules tree of that extension replaces the root's tree.
+// It also returns the names of the other override claimers and the normal
+// claimers.
+func modulesBindSource(kept []Extension) (source *Extension, others, normal []string) {
+	for i := range kept {
+		switch {
+		case !kept[i].ClaimsKernel:
+		case !kept[i].Override:
+			normal = append(normal, kept[i].Name)
+		case source == nil:
+			source = &kept[i]
+		default:
+			others = append(others, kept[i].Name)
+		}
+	}
+	return source, others, normal
+}
+
+// resolveModulesDir resolves root/lib/modules/release through symlinks. It
+// rejects a result outside root. An absolute symlink resolves against the
+// root of the caller, not against root.
+func resolveModulesDir(root, release string) (string, error) {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Join(root, "lib", "modules", release))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(realRoot, dir)
+	if err != nil || !filepath.IsLocal(rel) {
+		return "", fmt.Errorf("%s resolves outside %s", dir, realRoot)
+	}
+	return dir, nil
 }

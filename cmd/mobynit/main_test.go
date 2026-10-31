@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/balena-os/hostapp"
 	"golang.org/x/sys/unix"
 )
 
@@ -421,7 +422,7 @@ func TestMountDataOverlaysLeavesNoDataMountBehind(t *testing.T) {
 	newRoot := t.TempDir()
 	before := mountpointSet(t)
 	// No purge marker on an empty tmpfs: the early-return path
-	if err := mountDataOverlays(newRoot, nil); err != nil {
+	if err := mountDataOverlays(newRoot, nil, ""); err != nil {
 		t.Fatalf("mountDataOverlays: %v", err)
 	}
 
@@ -465,12 +466,44 @@ func TestComposedRootSurvivesWorkMountRelease(t *testing.T) {
 		t.Fatalf("writing marker: %v", err)
 	}
 
+	const release = "6.1.0-test"
+	modulesFile := func(layer, name, content string) {
+		dir := filepath.Join(layer, "lib", "modules", release)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("creating %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("writing %s: %v", name, err)
+		}
+	}
+	modulesFile(extLayer, "modules.dep", "extension")
+	modulesFile(baseLayer, "modules.dep", "base")
+	modulesFile(baseLayer, "base-only.ko", "base")
+
 	composed := t.TempDir()
 	opts := "lowerdir=" + extLayer + ":" + baseLayer
 	if err := unix.Mount("overlay", composed, "overlay", 0, opts); err != nil {
 		t.Skipf("overlay mount unavailable: %v", err)
 	}
 	defer unix.Unmount(composed, unix.MNT_DETACH)
+
+	// Overlayfs refuses a single lowerdir, so add an empty one.
+	emptyLayer := filepath.Join(work, "empty")
+	if err := os.MkdirAll(emptyLayer, 0o755); err != nil {
+		t.Fatalf("creating layer %s: %v", emptyLayer, err)
+	}
+	extMerged := t.TempDir()
+	extOpts := "lowerdir=" + extLayer + ":" + emptyLayer
+	if err := unix.Mount("overlay", extMerged, "overlay", 0, extOpts); err != nil {
+		t.Fatalf("mounting extension: %v", err)
+	}
+
+	hostapp.BindClaimedModules(composed, release, []hostapp.Extension{{Name: "kernel", MountPath: extMerged, Override: true, ClaimsKernel: true}})
+
+	// mountDataOverlays releases the extension mount before the work mount.
+	if err := unix.Unmount(extMerged, 0); err != nil {
+		t.Fatalf("releasing extension mount with the bind in place: %v", err)
+	}
 
 	if err := unix.Unmount(work, unix.MNT_DETACH); err != nil {
 		t.Fatalf("detaching work mount: %v", err)
@@ -485,5 +518,82 @@ func TestComposedRootSurvivesWorkMountRelease(t *testing.T) {
 	}
 	if string(got) != "extension" {
 		t.Errorf("composed root content = %q, want %q", got, "extension")
+	}
+
+	modules := filepath.Join(composed, "lib", "modules", release)
+	got, err = os.ReadFile(filepath.Join(modules, "modules.dep"))
+	if err != nil {
+		t.Fatalf("bound modules tree unreadable after release: %v", err)
+	}
+	if string(got) != "extension" {
+		t.Errorf("modules.dep = %q, want %q", got, "extension")
+	}
+	if _, err := os.Stat(filepath.Join(modules, "base-only.ko")); !os.IsNotExist(err) {
+		t.Errorf("base-only module stays visible through the bind: stat err = %v", err)
+	}
+}
+
+func TestCmdlineDisablesOverlays(t *testing.T) {
+	tests := []struct {
+		name, cmdline string
+		want          bool
+	}{
+		{"absent", "root=UUID=1234 rootwait console=tty0", false},
+		{"empty", "", false},
+		{"no_overlays", "root=UUID=1234 mobynit.no_overlays", true},
+		{"emergency", "root=UUID=1234 emergency", true},
+		// Pin the substring match the pivot path always had
+		{"substring", "root=UUID=1234 systemd.unit=emergency.target", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cmdlineDisablesOverlays(tc.cmdline); got != tc.want {
+				t.Errorf("cmdlineDisablesOverlays(%q) = %v, want %v", tc.cmdline, got, tc.want)
+			}
+		})
+	}
+}
+
+// claimingStore returns a data root claiming abi.
+func claimingStore(t *testing.T, abi string) string {
+	t.Helper()
+	data := t.TempDir()
+	if err := os.WriteFile(filepath.Join(data, hostapp.PURGE_MARKER_FILE), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(data, hostapp.DATA_LAYER_ROOT)
+	home := filepath.Join(root, "containers", "01")
+	if err := os.MkdirAll(home, 0755); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"ID":"aaa1","Name":"ext","Driver":"overlay2","Config":{"Labels":{"` +
+		hostapp.HOSTOS_BLOCKS_CLASS + `":"overlay","` +
+		hostapp.HOSTOS_BLOCKS_KERNEL_ABI_ID + `":"` + abi + `"}}}`
+	if err := os.WriteFile(filepath.Join(home, "config.v2.json"), []byte(config), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func TestClaimedABIs(t *testing.T) {
+	abi := strings.Repeat("a1", 32)
+	store := claimingStore(t, abi)
+	tests := []struct {
+		name             string
+		dataRoot         string
+		overlaysDisabled bool
+		want             []string
+	}{
+		{"store claims", store, false, []string{abi}},
+		// Claims nothing even though the store claims
+		{"overlays disabled", store, true, nil},
+		{"unreadable store", filepath.Join(t.TempDir(), "docker"), false, nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := claimedABIs(tc.dataRoot, tc.overlaysDisabled); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("claimedABIs(%q, %v) = %v, want %v", tc.dataRoot, tc.overlaysDisabled, got, tc.want)
+			}
+		})
 	}
 }
