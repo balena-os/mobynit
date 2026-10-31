@@ -41,6 +41,8 @@ type Container struct {
 	MountPath string
 	HomePath  string
 	Layers    []string
+	// Carries the running kernel, per ResolveExtensionABIID.
+	ClaimsKernel bool
 }
 
 var (
@@ -360,6 +362,11 @@ func ClaimedKernelABIs(rootdir string) ([]string, error) {
 		if abi == "" {
 			continue
 		}
+		// pid 1 drops a kernel-carrying extension that is not an override.
+		if _, ok := c.Labels[HOSTOS_BLOCKS_OVERRIDE]; !ok {
+			log.Printf("Warning: container %s: ignoring %s label without %s", c.Name, HOSTOS_BLOCKS_KERNEL_ABI_ID, HOSTOS_BLOCKS_OVERRIDE)
+			continue
+		}
 		// Deployers write the store; callers match whole lines.
 		if !validABIID(abi) {
 			log.Printf("Warning: container %s: ignoring malformed %s label %q", c.Name, HOSTOS_BLOCKS_KERNEL_ABI_ID, abi)
@@ -488,8 +495,8 @@ func KernelImageForABIID(bootDir, abi string) (string, []error, error) {
 // * carries one for another release
 //
 // Returns errors when an extension claims the running release but cannot be
-// matched to the running kernel: unknown release, stock kernel (empty
-// hostABIID), no /boot, or no /boot file hashing to hostABIID.
+// matched to the running kernel: no override label, unknown release, stock
+// kernel (empty hostABIID), no /boot, or no /boot file hashing to hostABIID.
 func (c *Container) ResolveExtensionABIID(release, hostABIID string) (string, error) {
 	if c.MountPath == "" {
 		return "", nil
@@ -512,6 +519,11 @@ func (c *Container) ResolveExtensionABIID(release, hostABIID string) (string, er
 			return "", nil
 		}
 		return "", fmt.Errorf("stat %s: %w", modDir, err)
+	}
+
+	// Only an override mounts left of the hostapp, over its modules tree.
+	if _, ok := c.Labels[HOSTOS_BLOCKS_OVERRIDE]; !ok {
+		return "", fmt.Errorf("extension %s: kernel-carrying but no %s label", c.Name, HOSTOS_BLOCKS_OVERRIDE)
 	}
 
 	if hostABIID == "" {
@@ -555,10 +567,12 @@ func FilterByKernelABIID(containers []Container, release, hostABIID string) []Co
 	var filtered []Container
 	for i := range containers {
 		c := &containers[i]
-		if _, err := c.ResolveExtensionABIID(release, hostABIID); err != nil {
+		abi, err := c.ResolveExtensionABIID(release, hostABIID)
+		if err != nil {
 			log.Printf("Error: dropping container %s: %v", c.Name, err)
 			continue
 		}
+		c.ClaimsKernel = abi != ""
 		filtered = append(filtered, *c)
 	}
 	return filtered
@@ -618,6 +632,10 @@ type Extension struct {
 	Name     string
 	Layers   []string
 	Priority int
+	// Only an override can replace hostapp files.
+	Override     bool
+	MountPath    string
+	ClaimsKernel bool
 }
 
 func lowerdirOptions(layers []string) string {
@@ -632,8 +650,9 @@ func lowerdirOptions(layers []string) string {
 // a partial image): rightExtensions first, then the lowest-priority
 // leftExtensions. The limit applies to the deduplicated string, so a layer an
 // extension shares with the base counts once. Drops are logged per name. The
-// set that fits is logged in mount order.
-func BuildOverlayOptions(baseLayers []string, leftExtensions, rightExtensions []Extension) string {
+// function logs the set that fits in mount order. It returns that set in
+// lowerdir order.
+func BuildOverlayOptions(baseLayers []string, leftExtensions, rightExtensions []Extension) (string, []Extension) {
 	sort.Slice(leftExtensions, func(i, j int) bool {
 		if leftExtensions[i].Priority != leftExtensions[j].Priority {
 			return leftExtensions[i].Priority < leftExtensions[j].Priority
@@ -694,5 +713,83 @@ func BuildOverlayOptions(baseLayers []string, leftExtensions, rightExtensions []
 		idx++
 	}
 
-	return opts
+	return opts, slices.Concat(leftExtensions[:leftIncluded], rightExtensions[:rightIncluded])
+}
+
+// BindClaimedModules binds the modules tree of the claiming override over
+// root's tree. A failure keeps the merged tree, because pid 1 must boot.
+func BindClaimedModules(root, release string, kept []Extension) {
+	source, others := modulesBindSource(kept)
+	if source == nil {
+		return
+	}
+	if len(others) > 0 {
+		log.Printf("Warning: extensions %v also claim kernel %s; using %s", others, release, source.Name)
+	}
+	src, err := resolveModulesDir(source.MountPath, release)
+	if err != nil {
+		log.Printf("Error: modules tree of extension %s: %v; keeping merged tree", source.Name, err)
+		return
+	}
+	dst, err := resolveModulesDir(root, release)
+	if err != nil {
+		log.Printf("Error: root modules tree: %v; keeping merged tree", err)
+		return
+	}
+	if err := unix.Mount(src, dst, "", unix.MS_BIND, ""); err != nil {
+		log.Printf("Error: binding %s over %s: %v; keeping merged tree", src, dst, err)
+		return
+	}
+	log.Printf("Bound modules of extension %s for kernel %s over the root", source.Name, release)
+}
+
+// modulesBindSource returns the first claimer in kept, which is in lowerdir
+// order. The modules tree of that extension replaces the root's tree. It also
+// returns the names of the other claimers. ResolveExtensionABIID lets only
+// overrides claim.
+func modulesBindSource(kept []Extension) (source *Extension, others []string) {
+	for i := range kept {
+		switch {
+		case !kept[i].ClaimsKernel:
+		case source == nil:
+			source = &kept[i]
+		default:
+			others = append(others, kept[i].Name)
+		}
+	}
+	return source, others
+}
+
+// resolveModulesDir resolves root/lib/modules/release through symlinks. It
+// rejects a modules directory that is not strictly under root, and a release
+// directory that is not strictly under the modules directory. An absolute
+// symlink resolves against the root of the caller, not against root.
+func resolveModulesDir(root, release string) (string, error) {
+	if release == "" {
+		return "", errors.New("empty kernel release")
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	modules, err := filepath.EvalSymlinks(filepath.Join(root, "lib", "modules"))
+	if err != nil {
+		return "", err
+	}
+	if !strictlyUnder(realRoot, modules) {
+		return "", fmt.Errorf("%s resolves outside %s", modules, realRoot)
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Join(modules, release))
+	if err != nil {
+		return "", err
+	}
+	if !strictlyUnder(modules, dir) {
+		return "", fmt.Errorf("%s resolves outside %s", dir, modules)
+	}
+	return dir, nil
+}
+
+func strictlyUnder(parent, path string) bool {
+	rel, err := filepath.Rel(parent, path)
+	return err == nil && rel != "." && filepath.IsLocal(rel)
 }

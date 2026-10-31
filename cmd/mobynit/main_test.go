@@ -466,12 +466,44 @@ func TestComposedRootSurvivesWorkMountRelease(t *testing.T) {
 		t.Fatalf("writing marker: %v", err)
 	}
 
+	const release = "6.1.0-test"
+	modulesFile := func(layer, name, content string) {
+		dir := filepath.Join(layer, "lib", "modules", release)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("creating %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("writing %s: %v", name, err)
+		}
+	}
+	modulesFile(extLayer, "modules.dep", "extension")
+	modulesFile(baseLayer, "modules.dep", "base")
+	modulesFile(baseLayer, "base-only.ko", "base")
+
 	composed := t.TempDir()
 	opts := "lowerdir=" + extLayer + ":" + baseLayer
 	if err := unix.Mount("overlay", composed, "overlay", 0, opts); err != nil {
 		t.Skipf("overlay mount unavailable: %v", err)
 	}
 	defer unix.Unmount(composed, unix.MNT_DETACH)
+
+	// Overlayfs refuses a single lowerdir, so add an empty one.
+	emptyLayer := filepath.Join(work, "empty")
+	if err := os.MkdirAll(emptyLayer, 0o755); err != nil {
+		t.Fatalf("creating layer %s: %v", emptyLayer, err)
+	}
+	extMerged := t.TempDir()
+	extOpts := "lowerdir=" + extLayer + ":" + emptyLayer
+	if err := unix.Mount("overlay", extMerged, "overlay", 0, extOpts); err != nil {
+		t.Fatalf("mounting extension: %v", err)
+	}
+
+	hostapp.BindClaimedModules(composed, release, []hostapp.Extension{{Name: "kernel", MountPath: extMerged, Override: true, ClaimsKernel: true}})
+
+	// mountDataOverlays releases the extension mount before the work mount.
+	if err := unix.Unmount(extMerged, 0); err != nil {
+		t.Fatalf("releasing extension mount with the bind in place: %v", err)
+	}
 
 	if err := unix.Unmount(work, unix.MNT_DETACH); err != nil {
 		t.Fatalf("detaching work mount: %v", err)
@@ -486,6 +518,18 @@ func TestComposedRootSurvivesWorkMountRelease(t *testing.T) {
 	}
 	if string(got) != "extension" {
 		t.Errorf("composed root content = %q, want %q", got, "extension")
+	}
+
+	modules := filepath.Join(composed, "lib", "modules", release)
+	got, err = os.ReadFile(filepath.Join(modules, "modules.dep"))
+	if err != nil {
+		t.Fatalf("bound modules tree unreadable after release: %v", err)
+	}
+	if string(got) != "extension" {
+		t.Errorf("modules.dep = %q, want %q", got, "extension")
+	}
+	if _, err := os.Stat(filepath.Join(modules, "base-only.ko")); !os.IsNotExist(err) {
+		t.Errorf("base-only module stays visible through the bind: stat err = %v", err)
 	}
 }
 
@@ -524,6 +568,7 @@ func claimingStore(t *testing.T, abi string) string {
 	}
 	config := `{"ID":"aaa1","Name":"ext","Driver":"overlay2","Config":{"Labels":{"` +
 		hostapp.HOSTOS_BLOCKS_CLASS + `":"overlay","` +
+		hostapp.HOSTOS_BLOCKS_OVERRIDE + `":"10","` +
 		hostapp.HOSTOS_BLOCKS_KERNEL_ABI_ID + `":"` + abi + `"}}}`
 	if err := os.WriteFile(filepath.Join(home, "config.v2.json"), []byte(config), 0644); err != nil {
 		t.Fatal(err)

@@ -39,7 +39,9 @@ mobynit -claimed-abis=/path  # Print claimed kernel ABI ids and exit
 ### Reporting claimed kernel ABIs
 
 `-claimed-abis=<docker data root>` prints the
-`io.balena.image.kernel-abi-id` of every OS block container in the store. It
+`io.balena.image.kernel-abi-id` of every override OS block container in the
+store. It ignores the label on a normal extension, because pid 1 does not
+mount a normal extension that carries a kernel. It
 prints one id per line, then exits. It prints nothing when `emergency` or
 `mobynit.no_overlays` is on the kernel command line. That boot mounts no OS
 block.
@@ -122,6 +124,23 @@ lowerdir=networking:security:hostapp:extras
 - `security` can replace hostapp and extras files, but not networking
 - `hostapp` can shadow extras files
 - `extras` can only contribute files not present in any layer above it
+
+#### Kernel modules
+
+A module set belongs to one kernel build. When an override extension claims
+the running kernel, mobynit binds its `/lib/modules/<release>` over the
+composed root. The bind hides the hostapp's copy. If several
+overrides claim the kernel, mobynit uses the first in `lowerdir` order and logs
+a warning.
+
+Only an override can claim a kernel. A normal extension mounts right of the
+hostapp, so the hostapp's modules would win at every shared path. mobynit
+treats a normal extension that carries the running kernel as a packaging
+fault. It logs an error and does not mount the extension. Give a kernel
+extension an override label.
+
+If the bind fails, mobynit logs an error and keeps the merged tree. The device
+still boots.
 
 #### Page size limits
 
