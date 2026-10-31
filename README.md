@@ -123,6 +123,22 @@ lowerdir=networking:security:hostapp:extras
 - `hostapp` can shadow extras files
 - `extras` can only contribute files not present in any layer above it
 
+#### Kernel modules
+
+A module set belongs to one kernel build. When an override extension claims
+the running kernel, mobynit binds its `/lib/modules/<release>` over the
+composed root. The bind hides the hostapp's copy. If several
+overrides claim the kernel, mobynit uses the first in `lowerdir` order and logs
+a warning.
+
+A normal extension never gets this bind, because it can only add files. If a
+normal extension carries the running kernel, the hostapp's files win at every
+shared path in that directory. That mix is a packaging fault, so mobynit logs
+an error. Give a kernel extension an override label.
+
+If the bind fails, mobynit logs an error and keeps the merged tree. The device
+still boots.
+
 #### Page size limits
 
 The kernel limits mount options to `PAGE_SIZE - 1` bytes. If extensions would

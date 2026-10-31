@@ -476,6 +476,7 @@ func TestBuildOverlayOptions(t *testing.T) {
 		leftExtensions  []Extension
 		rightExtensions []Extension
 		expected        string
+		kept            []string
 	}{
 		{
 			name:       "base only",
@@ -490,6 +491,7 @@ func TestBuildOverlayOptions(t *testing.T) {
 				{Layers: []string{"/n2"}, Name: "right2"},
 			},
 			expected: "lowerdir=/base:/n1a:/n1b:/n2",
+			kept:     []string{"right1", "right2"},
 		},
 		{
 			name:       "single left multi-layer",
@@ -498,6 +500,7 @@ func TestBuildOverlayOptions(t *testing.T) {
 				{Layers: []string{"/o1a", "/o1b"}, Name: "left1", Priority: 10},
 			},
 			expected: "lowerdir=/o1a:/o1b:/base",
+			kept:     []string{"left1"},
 		},
 		{
 			name:       "left sorting",
@@ -507,6 +510,7 @@ func TestBuildOverlayOptions(t *testing.T) {
 				{Layers: []string{"/o1"}, Name: "left1", Priority: 10},
 			},
 			expected: "lowerdir=/o1:/o2:/base",
+			kept:     []string{"left1", "left2"},
 		},
 		{
 			name:       "equal priority tie-break by name",
@@ -516,6 +520,7 @@ func TestBuildOverlayOptions(t *testing.T) {
 				{Layers: []string{"/aa"}, Name: "alpha", Priority: 10},
 			},
 			expected: "lowerdir=/aa:/zz:/base",
+			kept:     []string{"alpha", "zulu"},
 		},
 		{
 			name:       "both sides",
@@ -528,14 +533,18 @@ func TestBuildOverlayOptions(t *testing.T) {
 				{Layers: []string{"/n2"}, Name: "right2"},
 			},
 			expected: "lowerdir=/o1:/base:/n1:/n2",
+			kept:     []string{"left1", "right1", "right2"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := BuildOverlayOptions(tt.baseLayers, tt.leftExtensions, tt.rightExtensions)
+			result, kept := BuildOverlayOptions(tt.baseLayers, tt.leftExtensions, tt.rightExtensions)
 			if result != tt.expected {
 				t.Errorf("expected %q, got %q", tt.expected, result)
+			}
+			if names := extensionNames(kept); !reflect.DeepEqual(names, tt.kept) {
+				t.Errorf("kept: expected %v, got %v", tt.kept, names)
 			}
 		})
 	}
@@ -559,7 +568,7 @@ func TestBuildOverlayOptionsTruncation(t *testing.T) {
 		Name:   "right",
 	}
 
-	result := BuildOverlayOptions(baseLayers, []Extension{left}, []Extension{rightLong})
+	result, _ := BuildOverlayOptions(baseLayers, []Extension{left}, []Extension{rightLong})
 
 	if !strings.Contains(result, left.Layers[0]) {
 		t.Error("left extension chain missing from result")
@@ -580,7 +589,7 @@ func TestBuildOverlayOptionsTruncation(t *testing.T) {
 		Name:     "huge",
 		Priority: 1,
 	}
-	degraded := BuildOverlayOptions([]string{"/base"}, []Extension{hugeLeft}, nil)
+	degraded, _ := BuildOverlayOptions([]string{"/base"}, []Extension{hugeLeft}, nil)
 	if degraded != "lowerdir=/base" {
 		t.Errorf("expected bare base chain, got %q", degraded)
 	}
@@ -593,7 +602,7 @@ func TestBuildOverlayOptionsTruncation(t *testing.T) {
 		Name:     "two-layer",
 		Priority: 1,
 	}
-	partial := BuildOverlayOptions([]string{"/" + strings.Repeat("z", half)}, []Extension{twoLayer}, nil)
+	partial, _ := BuildOverlayOptions([]string{"/" + strings.Repeat("z", half)}, []Extension{twoLayer}, nil)
 	if strings.Contains(partial, twoLayer.Layers[0]) || strings.Contains(partial, twoLayer.Layers[1]) {
 		t.Errorf("partially-fitting chain must be dropped whole, got %q", partial)
 	}
@@ -609,7 +618,7 @@ func TestBuildOverlayOptionsTruncation(t *testing.T) {
 		Layers: []string{"/" + strings.Repeat("n", pageSize/4)},
 		Name:   "right",
 	}
-	mixed := BuildOverlayOptions(mediumBase, []Extension{bigLeft}, []Extension{rightExt})
+	mixed, _ := BuildOverlayOptions(mediumBase, []Extension{bigLeft}, []Extension{rightExt})
 	if !strings.Contains(mixed, bigLeft.Layers[0]) {
 		t.Error("left extension should be present")
 	}
@@ -680,7 +689,7 @@ func TestOverlayStacking(t *testing.T) {
 		t.Logf("OS block %d: %s at %s", i, c.Name, c.MountPath)
 	}
 
-	opts := BuildOverlayOptions(hostappContainers[0].Layers, nil, rightExtensions)
+	opts, _ := BuildOverlayOptions(hostappContainers[0].Layers, nil, rightExtensions)
 	t.Logf("Mount options: %s", opts)
 
 	if err := unix.Mount("overlay", stackedMount, "overlay", 0, opts); err != nil {
@@ -1308,6 +1317,123 @@ func TestFilterByKernelABIID(t *testing.T) {
 			if !reflect.DeepEqual(gotNames, tt.expectNames) {
 				t.Errorf("got %v, want %v", gotNames, tt.expectNames)
 			}
+			for _, c := range result {
+				if want := c.Name != "agnostic"; c.ClaimsKernel != want {
+					t.Errorf("%s: ClaimsKernel = %v, want %v", c.Name, c.ClaimsKernel, want)
+				}
+			}
+		})
+	}
+}
+
+func extensionNames(exts []Extension) []string {
+	var names []string
+	for _, e := range exts {
+		names = append(names, e.Name)
+	}
+	return names
+}
+
+func TestModulesBindSource(t *testing.T) {
+	normal := func(name string, claims bool) Extension {
+		return Extension{Name: name, Layers: []string{"/" + name}, ClaimsKernel: claims}
+	}
+	override := func(name string, claims bool) Extension {
+		e := normal(name, claims)
+		e.Override = true
+		return e
+	}
+	pageSize := os.Getpagesize()
+	huge := override("huge-claimer", true)
+	huge.Layers = []string{"/" + strings.Repeat("x", pageSize)}
+	huge.Priority = 1
+	// The page limit drops the claimer behind small.
+	_, keptWithoutHuge := BuildOverlayOptions([]string{"/base"}, []Extension{override("small", false), huge}, nil)
+	if names := extensionNames(keptWithoutHuge); !reflect.DeepEqual(names, []string{"small"}) {
+		t.Fatalf("fixture: expected only small kept, got %v", names)
+	}
+
+	tests := []struct {
+		name         string
+		kept         []Extension
+		expectSource string
+		expectOthers []string
+		expectNormal []string
+	}{
+		{"one override claimer", []Extension{override("a", false), override("k", true), normal("b", false)}, "k", nil, nil},
+		{"two override claimers, first in lowerdir order wins", []Extension{normal("a", false), override("k2", true), override("k1", true)}, "k2", []string{"k1"}, nil},
+		{"claimer dropped by the page limit", keptWithoutHuge, "", nil, nil},
+		{"no claimer", []Extension{override("a", false), normal("b", false)}, "", nil, nil},
+		{"normal claimer alone is reported, never picked", []Extension{override("a", false), normal("n", true)}, "", nil, []string{"n"}},
+		{"override claimer picked over a normal claimer", []Extension{override("k", true), normal("n", true)}, "k", nil, []string{"n"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source, others, normal := modulesBindSource(tt.kept)
+			got := ""
+			if source != nil {
+				got = source.Name
+			}
+			if got != tt.expectSource {
+				t.Errorf("source: got %q, want %q", got, tt.expectSource)
+			}
+			if !reflect.DeepEqual(others, tt.expectOthers) {
+				t.Errorf("others: got %v, want %v", others, tt.expectOthers)
+			}
+			if !reflect.DeepEqual(normal, tt.expectNormal) {
+				t.Errorf("normal: got %v, want %v", normal, tt.expectNormal)
+			}
+		})
+	}
+}
+
+func TestResolveModulesDir(t *testing.T) {
+	const release = "6.1.0-test"
+	// The tree exists, so containment rejects it, not ENOENT.
+	outside := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(outside, "usr", "lib", "modules", release), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name      string
+		libTarget func(root string) string
+		expectErr string
+	}{
+		{"relative lib -> usr/lib resolves inside root", func(string) string { return "usr/lib" }, ""},
+		{"absolute lib -> /usr/lib resolves outside root", func(string) string { return filepath.Join(outside, "usr", "lib") }, "outside"},
+		{"relative lib climbing out with .. resolves outside root", func(root string) string {
+			rel, err := filepath.Rel(root, filepath.Join(outside, "usr", "lib"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return rel
+		}, "outside"},
+		{"missing modules directory", func(string) string { return "usr/missing" }, "no such file"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			want := filepath.Join(root, "usr", "lib", "modules", release)
+			if err := os.MkdirAll(want, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(tt.libTarget(root), filepath.Join(root, "lib")); err != nil {
+				t.Fatal(err)
+			}
+			got, err := resolveModulesDir(root, release)
+			if tt.expectErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.expectErr) {
+					t.Errorf("expected an error containing %q, got %q, %v", tt.expectErr, got, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if realWant, _ := filepath.EvalSymlinks(want); got != realWant {
+				t.Errorf("got %q, want %q", got, realWant)
+			}
 		})
 	}
 }
@@ -1466,7 +1592,7 @@ func TestFlatComposeDepthBudget(t *testing.T) {
 	}
 
 	root := tdir("root")
-	opts := BuildOverlayOptions(baseLayers, []Extension{{Name: "ext", Layers: extLayers, Priority: 0}}, nil)
+	opts, _ := BuildOverlayOptions(baseLayers, []Extension{{Name: "ext", Layers: extLayers, Priority: 0}}, nil)
 	if err := unix.Mount("overlay", root, "overlay", 0, opts); err != nil {
 		t.Fatalf("flat root mount failed: %v (opts %q)", err, opts)
 	}
@@ -1614,7 +1740,7 @@ func TestFlatComposeWhiteoutSemantics(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	opts := BuildOverlayOptions(baseLayers, []Extension{{Name: "ext", Layers: extLayers, Priority: 0}}, nil)
+	opts, _ := BuildOverlayOptions(baseLayers, []Extension{{Name: "ext", Layers: extLayers, Priority: 0}}, nil)
 	if mountOpt != "" {
 		opts += "," + mountOpt
 	}
@@ -1687,7 +1813,7 @@ func TestBuildOverlayOptionsDedupSharedBase(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := BuildOverlayOptions(tt.baseLayers, tt.leftExtensions, tt.rightExtensions)
+			result, _ := BuildOverlayOptions(tt.baseLayers, tt.leftExtensions, tt.rightExtensions)
 			if result != tt.expected {
 				t.Errorf("expected %q, got %q", tt.expected, result)
 			}
@@ -1752,7 +1878,7 @@ func TestFlatComposeDedupSharedBaseKernel(t *testing.T) {
 		t.Fatalf("ext buildLowerDirs: %v", err)
 	}
 
-	opts := BuildOverlayOptions(baseLayers, []Extension{{Name: "ext", Layers: extLayers, Priority: 0}}, nil)
+	opts, _ := BuildOverlayOptions(baseLayers, []Extension{{Name: "ext", Layers: extLayers, Priority: 0}}, nil)
 	if n := strings.Count(opts, sharedShort); n != 1 {
 		t.Fatalf("shared layer listed %d times in %q, want exactly once", n, opts)
 	}
@@ -2383,7 +2509,7 @@ func TestBuildOverlayOptionsBudgetCountsSharedLayersOnce(t *testing.T) {
 			len(want), pageLimit)
 	}
 
-	if opts := BuildOverlayOptions(base, nil, []Extension{shared}); opts != want {
+	if opts, _ := BuildOverlayOptions(base, nil, []Extension{shared}); opts != want {
 		t.Errorf("an extension that fits once deduplicated must survive the budget\n got %q\nwant %q",
 			opts, want)
 	}

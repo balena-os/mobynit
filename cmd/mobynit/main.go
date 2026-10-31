@@ -210,6 +210,14 @@ func mountDataOverlays(newRootPath string, baseLayers []string, cmdline string) 
 	if len(containers) == 0 {
 		return nil
 	}
+	// The root and bind keep their own references.
+	defer func() {
+		for i := range containers {
+			if err := containers[i].Unmount(); err != nil {
+				log.Printf("Warning: releasing extension mount %s: %v", containers[i].Config.Name, err)
+			}
+		}
+	}()
 
 	// An empty release (e.g. uname failed) disables the version filter
 	release, err := hostapp.GetKernelRelease()
@@ -239,8 +247,10 @@ func mountDataOverlays(newRootPath string, baseLayers []string, cmdline string) 
 			return fmt.Errorf("Only overlay2 images supported, not %v", container.Config.Driver)
 		}
 		ext := hostapp.Extension{
-			Name:   container.Config.Name,
-			Layers: shortenChain(farm, container.Config.Name, container.Layers),
+			Name:         container.Config.Name,
+			Layers:       shortenChain(farm, container.Config.Name, container.Layers),
+			MountPath:    container.MountPath,
+			ClaimsKernel: container.ClaimsKernel,
 		}
 		if overrideVal, ok := container.Labels[hostapp.HOSTOS_BLOCKS_OVERRIDE]; ok {
 			priority, err := strconv.Atoi(overrideVal)
@@ -249,23 +259,20 @@ func mountDataOverlays(newRootPath string, baseLayers []string, cmdline string) 
 				log.Printf("Warning: container %s has invalid override priority %q, defaulting to lowest", container.Config.Name, overrideVal)
 			}
 			ext.Priority = priority
+			ext.Override = true
 			leftExtensions = append(leftExtensions, ext)
 		} else {
 			rightExtensions = append(rightExtensions, ext)
 		}
 	}
 
-	for i := range containers {
-		if err := containers[i].Unmount(); err != nil {
-			log.Printf("Warning: releasing extension mount %s: %v", containers[i].Config.Name, err)
-		}
-	}
-
-	mountOptions := hostapp.BuildOverlayOptions(baseLayers, leftExtensions, rightExtensions)
+	mountOptions, kept := hostapp.BuildOverlayOptions(baseLayers, leftExtensions, rightExtensions)
 
 	if err := unix.Mount("overlay", newRootPath, "overlay", 0, mountOptions); err != nil {
 		return fmt.Errorf("Error mounting image: %v", err)
 	}
+
+	hostapp.BindClaimedModules(newRootPath, release, kept)
 
 	return nil
 }
