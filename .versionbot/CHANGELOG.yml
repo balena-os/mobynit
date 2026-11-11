@@ -1,4 +1,61 @@
 - commits:
+    - subject: "mobynit: bind the claimed kernel's modules tree over the root"
+      hash: 01d6bd631140dba3cf7a1377ff8f9791480ab353
+      body: >
+        The hostapp and a kernel override extension share one release
+
+        string, so overlayfs merges their /lib/modules/<release>.
+
+
+        A module that only the base build ships stays visible to modprobe under
+        the
+
+        override kernel. The override extension that claims the running
+
+        kernel now owns that directory. Only an override can claim a kernel:
+
+        a normal extension mounts right of the hostapp, so the hostapp's
+
+        modules would win. -claimed-abis ignores its claim and pid 1 does not
+
+        mount it.
+
+
+        The release directory must resolve strictly under its modules
+
+        directory, so a symlink in an image cannot bind the extension's whole
+
+        tree over the system root.
+      footer:
+        Change-type: minor
+        change-type: minor
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+    - subject: "mobynit: claim no kernel ABI when overlays are disabled"
+      hash: bb5db9ee0d2392ec1fa4c68f2fcb3f939e442e05
+      body: >
+        `-claimed-abis` returned before the command line was parsed, so it
+
+        reported ABIs that the boot would not mount.
+
+
+        The flag describes what this boot will mount, and with the overlays off
+        it
+
+        mounts none.
+      footer:
+        Change-type: patch
+        change-type: patch
+        Signed-off-by: Alex Gonzalez <alexg@balena.io>
+        signed-off-by: Alex Gonzalez <alexg@balena.io>
+      author: Alex Gonzalez
+      nested: []
+  version: 1.3.0
+  title: ""
+  date: 2026-11-11T10:36:46.700Z
+- commits:
     - subject: "hostapp: count shared layers once against the page budget"
       hash: 3aceafaac065f679af4953b5824b87fea87c8e35
       body: |
