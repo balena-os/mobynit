@@ -91,12 +91,10 @@ const (
 	LOG_DIR                  = "/tmp/initramfs/"
 	LOG_FILE                 = "initramfs.debug"
 	CMDLINE_DISABLE_OVERLAYS = "mobynit.no_overlays"
+	CMDLINE_EMERGENCY        = "emergency"
 	DATA_WORK_DIR            = "/tmp/mobynit-data"
 	DATA_STATE_NAME          = "resin-data"
 )
-
-/* Do not overlay images */
-var disable_overlays bool
 
 // lowerdirFarm hands out short numbered symlinks pointing at extension merged
 // mountpoints.
@@ -176,7 +174,7 @@ func mountSysroot(rootdir string) ([]hostapp.Container, error) {
 	return containers, err
 }
 
-func mountDataOverlays(newRootPath string, baseLayers []string) error {
+func mountDataOverlays(newRootPath string, baseLayers []string, cmdline string) error {
 	device, err := os.Readlink(filepath.Join(stateDiskDir, DATA_STATE_NAME))
 	if err != nil {
 		return fmt.Errorf("No udev by-state resin-data symbolic link")
@@ -212,6 +210,14 @@ func mountDataOverlays(newRootPath string, baseLayers []string) error {
 	if len(containers) == 0 {
 		return nil
 	}
+	// The root and bind keep their own references.
+	defer func() {
+		for i := range containers {
+			if err := containers[i].Unmount(); err != nil {
+				log.Printf("Warning: releasing extension mount %s: %v", containers[i].Config.Name, err)
+			}
+		}
+	}()
 
 	// An empty release (e.g. uname failed) disables the version filter
 	release, err := hostapp.GetKernelRelease()
@@ -219,11 +225,7 @@ func mountDataOverlays(newRootPath string, baseLayers []string) error {
 		log.Printf("Warning: could not get kernel release: %v", err)
 	}
 
-	cmdline, err := os.ReadFile("/proc/cmdline")
-	if err != nil {
-		log.Printf("Warning: could not read /proc/cmdline: %v", err)
-	}
-	hostABIID := hostapp.ParseHostKernelABIID(string(cmdline))
+	hostABIID := hostapp.ParseHostKernelABIID(cmdline)
 
 	containers = hostapp.SelectMountable(containers, release, hostABIID)
 	if len(containers) == 0 {
@@ -245,8 +247,10 @@ func mountDataOverlays(newRootPath string, baseLayers []string) error {
 			return fmt.Errorf("Only overlay2 images supported, not %v", container.Config.Driver)
 		}
 		ext := hostapp.Extension{
-			Name:   container.Config.Name,
-			Layers: shortenChain(farm, container.Config.Name, container.Layers),
+			Name:         container.Config.Name,
+			Layers:       shortenChain(farm, container.Config.Name, container.Layers),
+			MountPath:    container.MountPath,
+			ClaimsKernel: container.ClaimsKernel,
 		}
 		if overrideVal, ok := container.Labels[hostapp.HOSTOS_BLOCKS_OVERRIDE]; ok {
 			priority, err := strconv.Atoi(overrideVal)
@@ -255,28 +259,25 @@ func mountDataOverlays(newRootPath string, baseLayers []string) error {
 				log.Printf("Warning: container %s has invalid override priority %q, defaulting to lowest", container.Config.Name, overrideVal)
 			}
 			ext.Priority = priority
+			ext.Override = true
 			leftExtensions = append(leftExtensions, ext)
 		} else {
 			rightExtensions = append(rightExtensions, ext)
 		}
 	}
 
-	for i := range containers {
-		if err := containers[i].Unmount(); err != nil {
-			log.Printf("Warning: releasing extension mount %s: %v", containers[i].Config.Name, err)
-		}
-	}
-
-	mountOptions := hostapp.BuildOverlayOptions(baseLayers, leftExtensions, rightExtensions)
+	mountOptions, kept := hostapp.BuildOverlayOptions(baseLayers, leftExtensions, rightExtensions)
 
 	if err := unix.Mount("overlay", newRootPath, "overlay", 0, mountOptions); err != nil {
 		return fmt.Errorf("Error mounting image: %v", err)
 	}
 
+	hostapp.BindClaimedModules(newRootPath, release, kept)
+
 	return nil
 }
 
-func prepareForPivot() (string, error) {
+func prepareForPivot(cmdline string) (string, error) {
 	var newRootPath string
 	if err := os.MkdirAll("/dev/shm", os.ModePerm); err != nil {
 		return "", fmt.Errorf("Creating /dev/shm failed: %v", err)
@@ -312,12 +313,41 @@ func prepareForPivot() (string, error) {
 		return newRootPath, fmt.Errorf("Creating %s failed: %v", PIVOT_PATH, err)
 	}
 
-	if !disable_overlays {
-		if err := mountDataOverlays(newRootPath, containers[0].Layers); err != nil {
+	if !cmdlineDisablesOverlays(cmdline) {
+		if err := mountDataOverlays(newRootPath, containers[0].Layers, cmdline); err != nil {
 			log.Print(err)
 		}
 	}
 	return newRootPath, nil
+}
+
+// Errors claim nothing; failing would boot the unclaimed override.
+func claimedABIs(dataRoot string, overlaysDisabled bool) []string {
+	if overlaysDisabled {
+		log.Println("Claiming no kernel ABI: overlays disabled on the command line")
+		return nil
+	}
+	abis, err := hostapp.ClaimedKernelABIs(dataRoot)
+	if err != nil {
+		log.Println("Claiming no kernel ABI:", err)
+		return nil
+	}
+	return abis
+}
+
+// Substring match; kexec relies on this answer.
+func cmdlineDisablesOverlays(cmdline string) bool {
+	return strings.Contains(cmdline, CMDLINE_EMERGENCY) ||
+		strings.Contains(cmdline, CMDLINE_DISABLE_OVERLAYS)
+}
+
+// Unreadable cmdline disables nothing.
+func readCmdline() string {
+	content, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		log.Printf("warning: could not read /proc/cmdline: %v (overlay flags ignored)", err)
+	}
+	return string(content)
 }
 
 func main() {
@@ -338,15 +368,7 @@ func main() {
 			// Fail closed: a fall-through would pivot in the bootloader initramfs
 			log.Fatalln("-claimed-abis requires a docker data root path")
 		}
-		// A store this boot cannot read is a store it will not mount, so
-		// every error claims nothing and the caller boots the stock kernel.
-		// Exiting non-zero here would make kexec boot the armed override
-		// kernel with none of its modules.
-		abis, err := hostapp.ClaimedKernelABIs(*claimedPtr)
-		if err != nil {
-			log.Println("Claiming no kernel ABI:", err)
-		}
-		for _, abi := range abis {
+		for _, abi := range claimedABIs(*claimedPtr, cmdlineDisablesOverlays(readCmdline())) {
 			fmt.Println(abi)
 		}
 		return
@@ -374,17 +396,7 @@ func main() {
 		log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 	}
 
-	content, err := os.ReadFile("/proc/cmdline")
-	if err != nil {
-		log.Printf("warning: could not read /proc/cmdline: %v (overlay flags ignored)", err)
-	} else {
-		args := strings.Fields(string(content))
-		for _, arg := range args {
-			if strings.Contains(arg, "emergency") || strings.Contains(arg, CMDLINE_DISABLE_OVERLAYS) {
-				disable_overlays = true
-			}
-		}
-	}
+	cmdline := readCmdline()
 
 	// Any mounts done by initrd will be transfered in the new root
 	mounts, err := getMounts()
@@ -396,7 +408,7 @@ func main() {
 		log.Fatalln("error remounting root as read/write:", err)
 	}
 
-	newRoot, err := prepareForPivot()
+	newRoot, err := prepareForPivot(cmdline)
 	if err != nil {
 		log.Fatalln("Error preparing for pivot root:", err)
 	}
